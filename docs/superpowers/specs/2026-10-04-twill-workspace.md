@@ -1,8 +1,8 @@
 # Twill — Workspace kind spec
 
-**Status:** Draft (revision 3 — parties + lifecycle + storage surface)
+**Status:** Draft (revision 4 — protocol-exact, provisionable, v1-wake-contract)
 **Date:** 2026-10-04
-**Inherits:** `2026-10-04-twill-fabric-core.md` (revision 4, authoritative).
+**Inherits:** `2026-10-04-twill-fabric-core.md` (revision 5, authoritative).
 This document instantiates that protocol; it does not restate or redefine
 it. Disagreements resolve in core's favor.
 **Scope:** the `Workspace` kind — schema, lifecycle mapping, route types,
@@ -93,14 +93,16 @@ the load-reject rule rather than silently accepted.
 ## 3. accessMode: RWO vs RWX
 
 `accessMode: RWO | RWX` declares the storage's concurrency story
-(informational in v1alpha1; leases formalize later):
+(informational v1alpha1; leases formalize the mechanics in v2):
 
-- `RWO` — single concurrent claimer (iSCSI-shaped). The Workspace
-  lifecycle maps an attached `claimedBy` (non-empty) onto `ready: false`
-  for new consumers. (The user-framing example: an RWO workspace that is
-  attached is `claimed: true, ready: false` for everyone but the holder.)
-- `RWX` — many concurrent claimers (NFS-shaped). A claim does not turn
-  readiness off: attached + ready is valid for new claimers.
+- `RWO` — single concurrent claimer (iSCSI-shaped). In v1alpha1 the
+  meaning is cooperative: consumers SHOULD check `claimedBy` (with its
+  `claimedOn` fingerprint — core §8.4) when opening an RWO workspace
+  and SHOULD warn (not block) on a second claim. The mechanical
+  "ready=false when claimed" mapping is v2-lease behavior and is
+  deferred to it.
+- `RWX` — many concurrent claimers (NFS-shaped). Claims do not turn
+  readiness off: attached + ready is valid for additional claimers.
 
 Default is `RWO`. Kind-owned; Card has no analogue because Card is not
 storage-backed.
@@ -110,8 +112,8 @@ storage-backed.
 | `type` | Mechanism | Kind-required fields | v1alpha1? |
 |---|---|---|---|
 | `local` | Direct filesystem + shell | `path` | yes |
-| `ssh` | SSH exec + SFTP | `address`, `path` | yes |
-| `k8s-exec` | `kubectl exec` + PVC | `pvc`, `path` — NOT a pod name | yes |
+| `ssh` | SSH exec + SFTP | `address`, `path`; optional `user`, `port` | yes |
+| `k8s-exec` | `kubectl exec` + PVC | `pvc`, `path`; optional `namespace`, `context` — NOT a pod name | yes |
 
 Route types are kind-owned (core §6.2). `local`/`ssh`/`k8s-exec` are this
 kind's names. `agent` is not a v1alpha1 route type (composite rationale
@@ -133,30 +135,29 @@ The kind-owned lifecycle and the `ready`-mapping into the protocol surface
 
 | Workspace-kind lifecycle state | Maps to `ready` | Notes |
 |---|---|---|
-| `cold` | `false` | Registered, not yet materialized; the 1000-services scenario |
-| `provisioning` | `false` | The clone/restore/spin-up is in flight |
-| `ready` | `true` | Materialized and no blocker to claim |
-| `degraded` | `true` + progress carries "degraded" | Attachable but provider wants you to know |
-| `down` | `false` | Provider reachable but reports the workspace down; provider dead = `down` by TTL expiry |
-| unknown values | `false` | Spec violation, treated as `down` |
+| `cold` | `false`, `provisionable: true` | Registered, not yet materialized; the 1000-services scenario |
+| `provisioning` | `false`, `provisionable: true` | The clone/restore/spin-up is in flight |
+| `ready` | `true`, `provisionable: false` | Materialized and no blocker to claim |
+| `degraded` | `true` + progress carries "degraded", `provisionable: false` | Attachable but provider wants you to know |
+| `down` | `false`, `provisionable: false` | Provider reachable but reports the workspace down; provider dead = `down` by TTL expiry |
+| unknown values | `false`, `provisionable: false` | Spec violation, treated as `down` |
 
 Extensions MAY be namespaced (`k8s:fenced`, `pvc:restoring`); they map
 onto `ready:false` for consumers, and appear in `progress`.
 
-**Cold workspace handling** (the enterprise case): a `cold` workspace is
-not rot; it is the cheap version of the workspace (no hot volume). The
-**adapter** is the party that deals with waking: when an adapter sees
-`ready:false` + a `progress` text carrying "cold" (or a namespaced state
-like `k8s:restoring` implying recoverable), it MAY wake the provider
-directly (kind-owned wake endpoint; protocol does not standardize it)
-and wait, subject to its own timeouts. This keeps resolve non-blocking:
-a cold workspace resolves fast with `ready:false` + `cold` progress, and
-the *wait* is owned by whoever can afford to wait — the consumer.
-
-Removed in rev 3: the earlier veto on `Attached` when `state != ready`
-is replaced by the surface contract above. Resolve is cheap;
-wake-and-wait is where the time goes, and it's the consumer's place
-to decide what to do.
+**Cold workspace handling (v1alpha1 wake contract).** A `cold` workspace
+is the cheap form of the workspace — no hot volume, provider can
+trovision it when asked. Selection is cheap and non-blocking: resolve
+returns a descriptor carrying `ready:false`, `provisionable:true`,
+`progress` carrying the provider's free-form note. The **consumer's
+adapter**, seeing `provisionable: true`, polls `resolve` in a loop
+at adapter-chosen interval (e.g. 5–10s) until either (a) the status
+flips to `ready: true` (the provider finished provisioning, either
+because a previous claimer requested it or because the provider's
+own watcher saw the first claim POST) or (b) the adapter's own
+timeout elapses. Direct "wake now" endpoint calls are v2; v1alpha1
+has claim-triggered lazy provisioning and adapter-side polls as the
+full loop.
 
 ## 6. Preconditions (provider-side)
 
@@ -213,6 +214,8 @@ The concrete registry shape (abstract in core §10.3):
   - `GET  /twill/v1alpha1` → discovery list (core §10.3 shape)
   - `GET  /twill/v1alpha1/<kind>/<name>` → the document
   - `POST /twill/v1alpha1/resolve` → Attached/NoMatch/Unreachable (core §7)
+  - `POST /twill/v1alpha1/<kind>/<name>/claim` → consumer claim (core §6.3)
+  - `POST /twill/v1alpha1/<kind>/<name>/release` → consumer release (core §6.3)
   - `POST /twill/v1alpha1/<kind>/<name>/statusReport` → provider push
   - `GET  /twill/v1alpha1/health` → `{"documentSet": "current|stale",
     "rejectedAt"?: ..., "reason"?: ...}` (core §8.3)

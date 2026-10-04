@@ -97,7 +97,7 @@ durable id); details there. The load-bearing constraints for this document:
 `owner` is required from day one (a string now vs an ACL migration later);
 `status` is reserved (readers must treat it as opaque; writers in v1alpha1
 must leave it empty); `storage.id` is present on storage-backed kinds and
-carries the write-serialization invariant (fabric-core §3).
+carries the write-serialization invariant (fabric-core §4.3).
 
 ---
 
@@ -114,11 +114,11 @@ metadata:
     twill/workspace-class: git        # git | shell | media | data
 spec:
   workspace:
-    storageBacked: true                # declared, not inferred (fabric-core §2.2)
+    storageBacked: true                # declared, not inferred (fabric-core §4.3)
     accessMode: RWO                    # RWO | RWX, kind-owned (v1alpha1 default RWO)
     storage:
       id: ws_01J8Z4-workstation-repos # durable; env-id serialization keys on this
-      fingerprint: vol-2c4f1a         # REQUIRED, content-stable (fabric-core §3)
+      fingerprint: vol-2c4f1a         # REQUIRED, content-stable (fabric-core §8.3)
     hostname: workstation
     toolHints: [git, forgejo-api, pi]
     shellPolicy: full                 # full | readonly | none
@@ -148,7 +148,7 @@ status: {}
 
 These three are the Workspace kind's route-type vocabulary in v1alpha1. (The
 fabric core protocol fixes only the route *envelope*; each kind owns its own
-`type` set — see fabric-core §5.2.) The `agent` route type from earlier
+`type` set — see fabric-core §6.2.) The `agent` route type from earlier
 drafts is **not** a v1alpha1 route; the delegation idea it gestured at lives
 on in §7.1 as a v2 design sketch informed by AWCP.
 
@@ -165,7 +165,8 @@ So each route carries an optional `precondition`:
 ```yaml
 - match: {agentLocation: cluster}
   type: k8s-exec
-  pvc: twill-ws-ws_01J8Z4
+  pvc: data-ws-01J8Z4
+  namespace: workspaces
   path: /workspace
   precondition:
     steps: [ { type: gitClone, url: forgejo/.../repo.git, ref: main } ]
@@ -187,7 +188,7 @@ pi-durable serializes `edit`/`write` by **env `id` + path**. Any two
 `ExecutionEnv`s resolving to the same physical storage MUST mint envs with the
 same `storage.id` (`spec.workspace.storage.id`). Renaming a workspace does NOT
 change `storage.id`. This is the single load-bearing rule of workspace
-routing; the **adapter** is the responsible actor (fabric-core §4.3, §7.2) so
+routing; the **adapter** is the responsible actor (fabric-core §4.3, §7) so
 cross-runtime serialization still works when two runtimes share a backing
 volume. The fingerprint mechanism that lets a registry *reject conflicting
 aliases* at load is core §8.3.
@@ -231,14 +232,14 @@ Do not implement Card from this document.
 - **Shape:** one process, config-file-backed (YAML list of CRD-shaped documents,
   watched), SQLite index for queries. In-cluster Deployment + PVC, single replica.
 - **Exposes:** `GET/PATCH /twill/v1alpha1/<kind>/<name>`, `POST resolve`
-  (concrete shape of the abstract resolution in fabric-core §6, kept in the
+  (concrete shape of the abstract resolution in fabric-core §7, kept in the
   registry because route evaluation shouldn't be re-implemented in every
   adapter).
 - **Auth:** v1 none (private, Authelia-fronted or tailnet-only + token header).
   Schema carries principal from day one.
 - **Sources (v1, both static):** bundled YAML config from a ConfigMap; in-cluster
   operator watch is v2.
-- **Discovery (abstract, owned by fabric-core §7.3):** a list of object
+- **Discovery (abstract, owned by fabric-core §10.3):** a list of object
   references with `{ kind, name, durable_id, resolvable }`, including inert
   objects (`resolvable: false` when a kind has no registered kind-runner or
   routes are empty). The concrete transport (HTTP, file walk, CLI output) is
