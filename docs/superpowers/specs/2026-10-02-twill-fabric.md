@@ -19,7 +19,7 @@ parked:
 | Doc | Role | Status |
 |---|---|---|
 | `2026-10-04-twill-fabric-core.md` | The protocol: CRD wrapper, `storage.id` invariant, routes, resolve algorithm, version policy. **Nothing runnable.** Injects no kind-specific behavior. | drafted 2026-10-04, in review |
-| `2026-10-XX-twill-workspace.md` | The Workspace kind: schemas, route types, `precondition`, adapters, deployment. Implementation target. | to be written |
+| `2026-10-04-twill-workspace.md` | The Workspace kind: schemas, route types, `precondition`, adapters, deployment. Implementation target. | draft revision 3, in dual review |
 | `../research/2026-10-04-twill-card-holding-note.md` | Card / skuld schema pins + deferred-design notes. **Not a spec.** | done |
 | `2026-10-04-twill-workspace.md` | The Workspace kind: schemas, route types, preconditions, adapters, deployment. Implementation target. | draft revision 2, in dual review |
 | agent / mcp / skill kinds (§2, §7 here) | reserved only | unchanged |
@@ -165,7 +165,7 @@ So each route carries an optional `precondition`:
 ```yaml
 - match: {agentLocation: cluster}
   type: k8s-exec
-  address: pod/twill-ws-ws_01J8Z4
+  pvc: twill-ws-ws_01J8Z4
   path: /workspace
   precondition:
     steps: [ { type: gitClone, url: forgejo/.../repo.git, ref: main } ]
@@ -176,10 +176,10 @@ So each route carries an optional `precondition`:
     steps: [ { type: worktree, repo: ~/repos/repo, branch: tw_123 } ]
 ```
 
-Precondition types: `gitClone`, `worktree`, `pvcBind`, `remoteMkdir`, `mountCheck`.
-Idempotent. Run once per claiming connection, or per lease (v2). This makes the
-"spin up a container, clone the repo, start the agent" workplace problem an
-**ordered list instead of a shell script**, which is the actual scaling win.
+Precondition types: `gitClone`, `worktree`, `pvcBind`, `remoteMkdir`,
+`mountCheck`. Idempotent. Provider-executed. This makes the "spin up a
+container, clone the repo, start the agent" workplace problem an **ordered
+list instead of a shell script**, which is the actual scaling win.
 
 ### 3.4 The one correctness invariant
 
@@ -187,40 +187,28 @@ pi-durable serializes `edit`/`write` by **env `id` + path**. Any two
 `ExecutionEnv`s resolving to the same physical storage MUST mint envs with the
 same `storage.id` (`spec.workspace.storage.id`). Renaming a workspace does NOT
 change `storage.id`. This is the single load-bearing rule of workspace
-routing; adapters for runtimes without this concept (hermes, opencode) mint
-their ids from `spec.workspace.storage.id` (fabric-core §3 makes the
-**adapter** the responsible actor) so cross-runtime serialization still works
-when two runtimes share a backing volume.
+routing; the **adapter** is the responsible actor (fabric-core §4.3, §7.2) so
+cross-runtime serialization still works when two runtimes share a backing
+volume. The fingerprint mechanism that lets a registry *reject conflicting
+aliases* at load is core §8.3.
 
-### 3.5 Resolution algorithm
+### 3.5 Resolution and parties
 
-The concrete resolution algorithm (`resolve(kind, name, consumer)`) and its
-three-result shape (Attached / NoMatch / Unreachable) is owned by
-`2026-10-04-twill-fabric-core.md` §6. The load-bearing shape:
-
-```
-resolve(Workspace, name, consumer) -> Attached | NoMatch | Unreachable:
-  ws     <- registry.get(Workspace, name)
-  routes <- ws.spec.routes.filter(matches(match, consumer))   # exact-string only
-  if routes is empty: return NoMatch
-  for r in routes (in declared order):
-    if not reachable(r): continue
-    for step in r.precondition.steps: run step; if fail, next route
-    env <- adapter.attach(r)                                  # ExecutionEnv-shaped
-    env.identity = ws.spec.workspace.storage.id               # forced, always
-    return Attached(env)
-  return Unreachable(per-route reasons)
-```
+The concrete resolution algorithm (`resolve(kind, name, consumer)` →
+Attached/NoMatch/Unreachable against a route-descriptor shape) is owned
+by fabric-core §7; the **party split** that governs it — registry selects,
+provider materializes and reports state, consumer attaches — is core §2.
+This composite's §3.5 in earlier drafts carried resolver-run preconditions
+and resolver-invoked attach; that shape is now recognized as unimplementable
+(registry can't reach consumer-local routes, can't serialize a capability),
+and the party-model of core rev 4 is the replacement.
 
 The `consumer` tuple is `{ agentLocation, agentKind, principal }`, each a
-string. For Workspace work the useful route-matching knobs are
-`agentLocation` (self-declared string names like `workstation`, `cluster`,
-`laptop-lan`) and the runtime family (match on `pi` or `hermes`, not
-versioned `pi/0.99.1` — see fabric-core §6.1 matching guidance).
+string. Match on the runtime family (`pi`, `hermes`), not a versioned
+agentKind (core §7.1 guidance).
 
-Resolution is deliberate per-consumer: the same workspace name can yield a
-local FS env for pi on the workstation and an SSH env for the twill-harness
-in-cluster, transparently to both.
+Resolution is deliberately per-consumer: the same name yields a local FS
+env to pi on the workstation and an SSH env to the twill-harness in cluster.
 
 ---
 

@@ -130,7 +130,7 @@ fabric object = spec (what it is, CRD-shaped) + routes[] (how YOU reach it)
 | Kind | Resolves to | v1 |
 |---|---|---|
 | `Workspace` | an fs+shell capability for the consumer's location | yes |
-| `Card` (skuld) | a work item with repo refs, spec link, claim state | schema-pinned, deferred |
+| `Card` (skuld) | a work item with repo refs, spec link, claim state | schema-pinned, deferred (see holding note) |
 | `MCPServer` | endpoint + credential profile per location | reserved |
 | `Skill` | versioned instruction bundles, registry-served | reserved |
 | `AgentProfile` | runtime + model + host + workspace for dispatch | reserved |
@@ -202,8 +202,10 @@ Adapter shapes differ by runtime and that is fine:
   them in the agent space, including a task board and a durable execution
   engine.
 - **skuld** — one of the Norns; "that which shall become." Reserved for the
-  card/work-item side of the fabric; the v1 implementation of `Card` ships
-  under the twill API and can be rebranded without protocol change.
+  card/work-item side of the fabric; when `Card` ships under the twill API it
+  can carry this name without protocol change. Card's implementation is
+  deferred until after `twill` + `twill-workspace` deployment (see the holding
+  note in `docs/superpowers/research/`).
 
 ---
 

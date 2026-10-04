@@ -33,7 +33,7 @@ spec:
   owner: <subject>
   routes: []          # likely unused for cards in v1alpha1; pinned for envelope
   card:
-    storageBacked: false               # per fabric-core §2.2: Card is NOT storage-backed
+    storageBacked: false               # per fabric-core §4.3: Card is NOT storage-backed
     id: cd_...        # durable id (Card's identity; no write serialization invariant)
     title: <string>
     state: idea | specced | ready | claimed | executing | review | done | blocked
@@ -42,10 +42,16 @@ spec:
     spec_ref: <link to a spec/PR/issue>
     claimed_by: <session/run id | "">
     claim_token: <random | "">
-    parent_card: <card name | "">
     labels: [<strings>]
-status: {}      # reserved, controller-owned in v2
+  parent: null        # or { kind: Card, name: <parent card> } (core §4.2; supersedes the drafts' card.parent_card)
+status: {}            # reserved, controller-owned in v2
 ```
+
+(`parent_card` from the revision-1 drafts is moved to the protocol-level
+`parent` field defined in fabric-core §4.2 — delete-on-resume the future
+Card spec should use `spec.parent`, not a kind-local duplicate. This note
+updates the pinned schema accordingly so adapters reading Cards see the
+protocol-level field.)
 
 Pinned because adapters and the discovery endpoint (`GET /twill/v1alpha1`
 listing kinds) round-trip Card *shape* in v1 even though no Card *service*
