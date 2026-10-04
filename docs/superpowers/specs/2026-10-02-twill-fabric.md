@@ -1,10 +1,33 @@
 # Twill: an agent-agnostic work fabric
 
-**Status:** Draft, pre-implementation
-**Date:** 2026-10-02
+**Status:** Draft, pre-implementation (structured as rationale + roadmap —
+the implementation specs that supersede parts of this composite are listed in
+§0.0)
+**Date:** 2026-10-02 (updated 2026-10-04: Card moved to holding note; AWCP added)
 **Scope:** twill registry + resolve/route protocol + adapters. **Not** a personal
 assistant (that's `sigrun`, see its spec).
 **Repo:** `twill` (currently `~/repos/pi-assistant`, to be renamed)
+
+### 0.0 Spec structure (post-2026-10-04)
+
+During review, this composite was recognized as the wrong unit for
+implementation planning (it bundles one thin protocol, one buildable kind,
+and three reserved kinds). The fabric is now structured as **one protocol
+spec plus one spec per built kind**, with Card and the other reserved kinds
+parked:
+
+| Doc | Role | Status |
+|---|---|---|
+| `2026-10-04-twill-fabric-core.md` | The protocol: CRD wrapper, `storage.id` invariant, routes, resolve algorithm, version policy. **Nothing runnable.** Injects no kind-specific behavior. | drafted 2026-10-04, in review |
+| `2026-10-XX-twill-workspace.md` | The Workspace kind: schemas, route types, `precondition`, adapters, deployment. Implementation target. | to be written |
+| `../research/2026-10-04-twill-card-holding-note.md` | Card / skuld schema pins + deferred-design notes. **Not a spec.** | done |
+| agent / mcp / skill kinds (§2, §7 here) | reserved only | unchanged |
+
+**Inheritance rule:** kind specs inherit the core protocol spec; they may not
+restate or redefine it. Any disagreement is resolved in favor of core. The
+remaining sections of this document are the *rationale* (§1–2, §6) and the
+*roadmap* (§8–10) the specs derive from; where this composite and a child
+spec disagree, the child spec wins for its kind.
 
 ---
 
@@ -28,6 +51,12 @@ provisioning-hook JSON. Twill raises the common structure into a registry.
 Adding a new workspace (or changing where one lives) becomes a registry edit,
 not a config in every agent.
 
+Within today's agent protocol landscape — MCP (agent ↔ tool), A2A/ANP
+(agent ↔ agent) — twill occupies the missing **agent ↔ workspace** layer: the
+registry that decides *which* remote mechanism, per object, per consumer. It
+complements rather than competes with transport-level protocols such as AWCP
+(arXiv 2602.20493), which the reserved `agent` route type references (§7.1).
+
 ### 1.1 What twill is not
 
 - Not an agent runtime. pi, hermes, opencode, claude-code, cursor keep running
@@ -47,7 +76,7 @@ no behavior yet, land when their extension does).
 | Kind | v1? | What it resolves to | Notes |
 |---|---|---|---|
 | `Workspace` | **Yes** | An `ExecutionEnv`-shaped capability for the requesting agent's location | The core object. §3. |
-| `Card` (skuld) | **Yes** | A work item with repo_refs, workspace_ref, spec, claim state | The cross-agent kanban. §4. |
+| `Card` (skuld) | schema only | A work item with repo_refs, workspace_ref, spec, claim state | Deferred; see holding note (`../research/2026-10-04-twill-card-holding-note.md`) |
 | `MCPServer` | reserved | Endpoint + credential profile per agent location | "my searxng" everywhere, no per-agent config drift |
 | `Skill` | reserved | Versioned instruction bundles, registry-served | alternative to "superpowers belongs to pi, LCM to hermes" |
 | `AgentProfile` | reserved | Runtime + model + host + workspace for subagent dispatch | the remote-implementer thing in §7 |
@@ -120,7 +149,7 @@ status: {}
 | `local` | Direct filesystem + shell | **yes** |
 | `ssh` | SSH `exec` + SFTP for file ops | **yes** |
 | `k8s-exec` | `kubectl exec` + PVC | **yes** |
-| `agent` | Dial-out ws-agent (brokered, handles NAT/sleep) | reserved for v2 |
+| `agent` | Workspace delegation to a remote executor — lease-bounded, executor may narrow terms (AWCP-compatible, see §7.1) | reserved for v2 |
 
 `agent` is reserved so a workspace-agent registration doesn't need a schema
 bump. Unimplemented in v1.
@@ -188,53 +217,17 @@ in-cluster, transparently to both.
 
 ---
 
-## 4. `Card` — skuld, the cross-agent kanban
+## 4. `Card` — skuld, moved to a holding note
 
-Forgejo issues are per-repo. Homelab/enterprise work routinely spans ≥2 repos
-(app repo + flux repo; N services). Card gives cross-repo execution a home.
+Card's rationale (cross-repo work has no per-repo home; cards as future
+dispatch handles) is unchanged, but its design was judged underbaked relative
+to the fabric layer during 2026-10-04 review. Card was extracted to
+`../research/2026-10-04-twill-card-holding-note.md`, which preserves the
+schema pins needed for fabric forward-compatibility plus the full revisit
+inputs (AWCP lease model, Beads, Agent Teams). Implementation is **deferred
+until after** the fabric + `twill-workspace` deployment.
 
-### 4.1 Schema (v1 fields only; same CRD wrapper shape)
-
-```yaml
-spec:
-  title: "Add disk-temperature alerting for TrueNAS"
-  body: <markdown>
-  state: idea | specced | ready | claimed | executing | review | done | blocked
-  workspace_ref: workstation-repos    # optional workspaces get card claims
-  spec_ref: forgejo/example/homelab-specs/...#L1
-  repo_refs: [forgejo/example/truenas-alerts, forgejo/example/flux-cluster]
-  owner: user:example
-  claimed_by: ""                      # session/run id
-  claim_token: ""                     # random, matched on update (weak unique-claimer)
-  parent_card: ""                     # breakdowns (deploy X -> child cards per repo)
-  labels: [observability, truenas]
-```
-
-### 4.2 API (tiny REST, SQLite-backed)
-
-- `POST /cards` `GET /cards` `GET /cards/:id` `PATCH /cards/:id`
-- `POST /cards/:id/claim` → 200 with `claim_token`; transitions `ready→claimed`
-- `POST /cards/:id/release` → `claimed→ready`
-
-### 4.3 State machine (v1, deliberately dumb)
-
-`idea → specced → ready → claimed → executing → review → done | blocked`
-
-`claimed` and `executing` are separate: claiming is the atomic reservation,
-executing means the claimer's agent process is actually running. Lets the UI
-distinguish "taken but not yet started" — the away-from-desk "did it pick it up?"
-question.
-
-No automatic transitions in v1. Agents (pi) and humans move cards; the service
-validates transitions only. Workflow automation (auto-claim on conditions,
-SLAs) is the thing to add when the manual loop demonstrably hurts.
-
-### 4.4 Cards as dispatch handles (forward pointer)
-
-When §7's AgentProfile dispatch arrives, a `claimed` Card with an AgentProfile
-workspace + an approved runner model is the thing that spawns remote agents.
-Cards are thus the *v1-visible* part of the subagent-dispatch design: get them
-right, dispatch later is low-diff.
+Do not implement Card from this document.
 
 ---
 
@@ -295,6 +288,39 @@ spec:
 
 Dispatch protocol is out of scope for v1.
 
+### 7.1 The `agent` route type — delegation, not brokering
+
+The reserved `agent` route type is **workspace delegation**: the consuming
+runtime leases the workspace *to* a remote executor (e.g. a subagent on another
+host sharing the parent session's workspace), which operates on the files with
+its own toolchain and returns results. This supersedes the earlier "dial-out
+brokered ws-agent" sketch: brokering a shell re-implements SSH badly, whereas
+delegation is the pattern the literature formalizes — AWCP (arXiv 2602.20493,
+*Agent Workspace Collaboration Protocol*) is the reference protocol and a
+candidate implementation basis.
+
+Design inputs taken from AWCP, applied when §7 lands:
+
+- **Lease-bounded access.** Delegations carry a TTL and an access mode
+  (read-only | read-write); the executor may *narrow* the terms (cap the TTL,
+  downgrade write → read-only) instead of a bare accept/reject. This maps onto
+  the claim/lease machinery Cards grow in v2.
+- **Transport capability declaration.** Each delegation transport (SSHFS-style
+  live mount, archive, object storage, git) declares live-sync vs snapshot; the
+  declaration selects the reconciliation strategy (apply automatically / stage
+  for review / discard). The `agent` route schema carries this capability bit
+  when specified.
+- **Dual state machines.** Delegator side owns the full lifecycle (negotiate →
+  provision → execute → reconcile); executor side is deliberately minimal.
+  Synchronization is via protocol messages only — no shared state store. This
+  keeps twill's fabric stateless about delegation progress.
+
+Adoption posture: twill's schema should be *compatible with* AWCP's delegation
+model (their `TransportHandle` overlaps `precondition`; their lease maps onto
+route terms), but the AWCP implementation is not adopted wholesale — it has no
+registry, no per-consumer resolution, and no k8s/route concerns. Exact
+message-level compatibility is a §7-implementation-time decision.
+
 ## 8. Deployment (v1)
 
 - In-cluster: single Deployment + PVC (`itty-nfs-flashy`, 4Gi), ClusterIP svc,
@@ -313,16 +339,15 @@ Dispatch protocol is out of scope for v1.
 - **T2 (2–3 days):** pi adapter (`twill-pi` extension) — `ExecutionEnv`
   from resolved route, with precondition support. Reference implementation,
   drives any API mistakes to the surface. Local + ssh routes.
-- **T3 (1–2 days):** Card/skuld service, per §4.
-- **T4 (2 days):** k8s-exec route + precondition engine (`gitClone`,
+- **T3 (2 days):** k8s-exec route + precondition engine (`gitClone`,
   `worktree`, `remoteMkdir`).
-- **T5 (1 day):** hermes terminal-backend module `twill`, minimal — enough for
+- **T4 (1 day):** hermes terminal-backend module `twill`, minimal — enough for
   sigrun (it's a consumer too, through twill-ext-kanban).
-- **T6 (deferred):** MCP server, Skill, AgentProfile schemas (fields reserved);
-  `status:` writer; Authelia OIDC.
+- **T5 (deferred):** Card/skuld per the holding note; MCP server, Skill,
+  AgentProfile schemas (fields reserved); `status:` writer; Authelia OIDC.
 
-Total v1: ~1 week of focused work. T5 can be skipped if hermes isn't a target
-by then; the survey (§6) means it costs almost nothing when needed.
+Target: a working twill + twill-workspace deployment before Card work begins;
+the survey (§6) means adapters cost almost nothing when needed.
 
 ## 10. Sibling project
 

@@ -40,6 +40,15 @@ The consequences show up as config drift and ceremony:
 Twill raises the common structure into a registry: a typed directory of fabric
 objects with an ordered, per-consumer **resolve-and-route** protocol.
 
+Positioned against the emerging agent protocol stack, the layers split cleanly:
+MCP standardizes the **agent ↔ tool** boundary, A2A/ANP standardize
+**agent ↔ agent** messaging, and neither answered **agent ↔ workspace** —
+where the agent's work physically happens and how it gets there. Twill is that
+third layer, at the registry level: naming, resolution, and provisioning of
+execution environments. The transport-level sibling is AWCP (arXiv 2602.20493),
+which formalizes *workspace delegation* between agents, independently identifies
+the same gap, and informs the reserved `agent` route type (see spec §7).
+
 ---
 
 ## 2. Scenarios
