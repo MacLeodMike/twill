@@ -33,7 +33,8 @@ spec:
   owner: <subject>
   routes: []          # likely unused for cards in v1alpha1; pinned for envelope
   card:
-    id: cd_...        # durable id (Card's identity; no write serialization)
+    storageBacked: false               # per fabric-core §2.2: Card is NOT storage-backed
+    id: cd_...        # durable id (Card's identity; no write serialization invariant)
     title: <string>
     state: idea | specced | ready | claimed | executing | review | done | blocked
     workspace_ref: <workspace name, optional>

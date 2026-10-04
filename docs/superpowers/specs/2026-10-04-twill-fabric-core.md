@@ -364,7 +364,9 @@ document, the *resolution behavior*, and the *discovery shape* above.
   is its own business.
 - Not a delegation protocol: `agent` route types (when a kind spec defines
   one) are elaborations of that kind, not core vocabulary. The AWCP design
-  inputs (arXiv 2602.20493) live in the workspace kind spec's §7.1.
+  inputs (arXiv 2602.20493) are a design sketch in the composite rationale
+  (`2026-10-02-twill-fabric.md` §7.1) and will land in whatever kind spec
+  claims them when implemented.
 
 ## Appendix A. Terms
 

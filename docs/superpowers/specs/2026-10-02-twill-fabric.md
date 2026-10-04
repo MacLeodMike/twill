@@ -21,6 +21,7 @@ parked:
 | `2026-10-04-twill-fabric-core.md` | The protocol: CRD wrapper, `storage.id` invariant, routes, resolve algorithm, version policy. **Nothing runnable.** Injects no kind-specific behavior. | drafted 2026-10-04, in review |
 | `2026-10-XX-twill-workspace.md` | The Workspace kind: schemas, route types, `precondition`, adapters, deployment. Implementation target. | to be written |
 | `../research/2026-10-04-twill-card-holding-note.md` | Card / skuld schema pins + deferred-design notes. **Not a spec.** | done |
+| `2026-10-04-twill-workspace.md` | The Workspace kind: schemas, route types, preconditions, adapters, deployment. Implementation target. | draft revision 2, in dual review |
 | agent / mcp / skill kinds (§2, §7 here) | reserved only | unchanged |
 
 **Inheritance rule:** kind specs inherit the core protocol spec; they may not
@@ -113,9 +114,11 @@ metadata:
     twill/workspace-class: git        # git | shell | media | data
 spec:
   workspace:
+    storageBacked: true                # declared, not inferred (fabric-core §2.2)
+    accessMode: RWO                    # RWO | RWX, kind-owned (v1alpha1 default RWO)
     storage:
       id: ws_01J8Z4-workstation-repos # durable; env-id serialization keys on this
-      fingerprint: ""                 # v2: volume UUID / machine-id, controller-verified
+      fingerprint: vol-2c4f1a         # REQUIRED, content-stable (fabric-core §3)
     hostname: workstation
     toolHints: [git, forgejo-api, pi]
     shellPolicy: full                 # full | readonly | none
@@ -340,17 +343,14 @@ message-level compatibility is a §7-implementation-time decision.
 
 ## 9. Milestones
 
-- **T1 (1–2 days):** registry process + resolve endpoint + YAML watch +
-  Workspace kind only. First consumer: a small `twill` CLI that prints
-  `resolve workstation-repos` for both `agentLocation: workstation` and
-  `agentLocation: cluster`.
-- **T2 (2–3 days):** pi adapter (`twill-pi` extension) — `ExecutionEnv`
-  from resolved route, with precondition support. Reference implementation,
-  drives any API mistakes to the surface. Local + ssh routes.
-- **T3 (2 days):** k8s-exec route + precondition engine (`gitClone`,
-  `worktree`, `remoteMkdir`).
-- **T4 (1 day):** hermes terminal-backend module `twill`, minimal — enough for
-  sigrun (it's a consumer too, through twill-ext-kanban).
+- **T1 (1–2 days):** registry process + `POST /resolve` + document watch +
+  discovery + `Workspace.statusReport` + fingerprint load-reject +
+  Workspace kind only. First consumer: the `twill` CLI making HTTP calls
+  (prints the route descriptor; not a second resolver).
+- **T2 (2–3 days):** pi adapter (`twill-pi` extension) — local + ssh routes
+  + provider-driven preconditions; reference implementation.
+- **T3 (2 days):** k8s-exec route + remaining step types.
+- **T4 (1 day):** hermes terminal-backend module `twill` (sigrun consumer).
 - **T5 (deferred):** Card/skuld per the holding note; MCP server, Skill,
   AgentProfile schemas (fields reserved); `status:` writer; Authelia OIDC.
 
