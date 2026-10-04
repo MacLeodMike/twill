@@ -164,11 +164,13 @@ So each route carries an optional `precondition`:
   type: k8s-exec
   address: pod/twill-ws-ws_01J8Z4
   path: /workspace
-  precondition: { type: gitClone, url: forgejo/.../repo.git, ref: main }
+  precondition:
+    steps: [ { type: gitClone, url: forgejo/.../repo.git, ref: main } ]
 - match: {agentLocation: workstation}
   type: local
   path: ~/repos/repo/card/tw_123
-  precondition: { type: worktree, repo: ~/repos/repo, branch: tw_123 }
+  precondition:
+    steps: [ { type: worktree, repo: ~/repos/repo, branch: tw_123 } ]
 ```
 
 Precondition types: `gitClone`, `worktree`, `pvcBind`, `remoteMkdir`, `mountCheck`.
