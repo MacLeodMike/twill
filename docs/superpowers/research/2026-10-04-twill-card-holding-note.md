@@ -115,7 +115,7 @@ survey; the Card spec session must consciously respond to each:
   `v1alpha1` with `resolvable: false` even though no Card service runs —
   registry documents of kind Card are valid, just inert. The abstract
   discovery list shape is `{ kind, name, durable_id, resolvable }` (fabric-core
-  §7.3); concrete transport is the registry service's business.
+  §10.3); concrete transport is the registry service's business.
 - Card documents in registry YAML are **inert** in v1: no resolve behavior,
   no precondition behavior, no status writes.
 - The Card kind does not exempt any agent adapter from implementing Workspace

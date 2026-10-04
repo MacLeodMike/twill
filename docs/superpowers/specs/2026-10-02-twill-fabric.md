@@ -19,9 +19,8 @@ parked:
 | Doc | Role | Status |
 |---|---|---|
 | `2026-10-04-twill-fabric-core.md` | The protocol: CRD wrapper, `storage.id` invariant, routes, resolve algorithm, version policy. **Nothing runnable.** Injects no kind-specific behavior. | drafted 2026-10-04, in review |
-| `2026-10-04-twill-workspace.md` | The Workspace kind: schemas, route types, `precondition`, adapters, deployment. Implementation target. | draft revision 3, in dual review |
+| `2026-10-04-twill-workspace.md` | The Workspace kind: schemas, route types, `precondition`, adapters, deployment. Implementation target. | draft revision 5, in dual review |
 | `../research/2026-10-04-twill-card-holding-note.md` | Card / skuld schema pins + deferred-design notes. **Not a spec.** | done |
-| `2026-10-04-twill-workspace.md` | The Workspace kind: schemas, route types, preconditions, adapters, deployment. Implementation target. | draft revision 2, in dual review |
 | agent / mcp / skill kinds (§2, §7 here) | reserved only | unchanged |
 
 **Inheritance rule:** kind specs inherit the core protocol spec; they may not
@@ -71,14 +70,16 @@ complements rather than competes with transport-level protocols such as AWCP
 
 ## 2. Objects in the registry
 
-Five object kinds. One is v1 (`Workspace`); four are **schema-reserved** (the
-fields exist, no behavior yet, land when their extension does). Card's schema
+Six object kinds. Two are v1 (`Workspace` + `Claim`); four are **schema-
+reserved** or schema-pinned (the fields exist, no behavior yet, land when
+their extension does). Card's schema
 is pinned (see `../research/2026-10-04-twill-card-holding-note.md`) but its
 implementation is deferred — see §0.0 and §4.
 
 | Kind | v1? | What it resolves to | Notes |
 |---|---|---|---|
 | `Workspace` | **Yes** | An `ExecutionEnv`-shaped capability for the requesting agent's location | The core object. §3. |
+| `Claim` | **Yes** | A first-class child request for materialization against a resource | The PVC-style claim; see §3 in this doc + §9 of core |
 | `Card` (skuld) | schema only | A work item under `spec.card` (id, state, repo_refs, spec_ref, claim state) | Deferred; see holding note (`../research/2026-10-04-twill-card-holding-note.md`) |
 | `MCPServer` | reserved | Endpoint + credential profile per agent location | "my searxng" everywhere, no per-agent config drift |
 | `Skill` | reserved | Versioned instruction bundles, registry-served | alternative to "superpowers belongs to pi, LCM to hermes" |
@@ -90,10 +91,10 @@ features, not protocol revolutions.
 
 ### 2.1 Common shape
 
-All five kinds follow one form (CRD-forward). The concrete envelope is
+All six kinds follow one form (CRD-forward). The concrete envelope is
 owned by `2026-10-04-twill-fabric-core.md` (§2): top-level `spec.` carries
-`owner`, `routes`, and `spec.<kindname>` (the kind's own data, including its
-durable id); details there. The load-bearing constraints for this document:
+`owner`, `routes`, `spec.<kindname>`, and `parent` (children are first-class);
+details there. The load-bearing constraints for this document:
 `owner` is required from day one (a string now vs an ACL migration later);
 `status` is reserved (readers must treat it as opaque; writers in v1alpha1
 must leave it empty); `storage.id` is present on storage-backed kinds and
@@ -230,13 +231,14 @@ Do not implement Card from this document.
 ## 5. The registry service (v1)
 
 - **Shape:** one process, config-file-backed (YAML list of CRD-shaped documents,
-  watched), SQLite index for queries. In-cluster Deployment + PVC, single replica.
-- **Exposes:** `GET/PATCH /twill/v1alpha1/<kind>/<name>`, `POST resolve`
-  (concrete shape of the abstract resolution in fabric-core §7, kept in the
-  registry because route evaluation shouldn't be re-implemented in every
-  adapter).
-- **Auth:** v1 none (private, Authelia-fronted or tailnet-only + token header).
-  Schema carries principal from day one.
+  watched). In-cluster Deployment + PVC, single replica.
+- **Exposes (concrete HTTP surface is in the workspace kind spec):**
+  `GET /twill/v1alpha1` (discovery), `GET /twill/v1alpha1/<kind>/<name>`,
+  `POST /twill/v1alpha1/resolve`, `POST /<kind>/<name>/claims`,
+  `GET /claims?parent=<name>` (provider read-path), provider `statusReport`
+  push, `GET /twill/v1alpha1/health`, and `PATCH`.
+- **Auth:** v1 deployment-shaped (Tailnet-only LoadBalancer Service, or a
+  token header); `principal` self-declared.
 - **Sources (v1, both static):** bundled YAML config from a ConfigMap; in-cluster
   operator watch is v2.
 - **Discovery (abstract, owned by fabric-core §10.3):** a list of object

@@ -1,30 +1,23 @@
 # Twill — Workspace kind spec
 
-**Status:** Draft (revision 4 — protocol-exact, provisionable, v1-wake-contract)
+**Status:** Draft (revision 5 — Claim-first-class, lifecycle mapping)
 **Date:** 2026-10-04
-**Inherits:** `2026-10-04-twill-fabric-core.md` (revision 5, authoritative).
-This document instantiates that protocol; it does not restate or redefine
-it. Disagreements resolve in core's favor.
+**Inherits:** `2026-10-04-twill-fabric-core.md` (revision 6, authoritative).
+This document instantiates; it does not restate or redefine core.
 **Scope:** the `Workspace` kind — schema, lifecycle mapping, route types,
 preconditions, adapters, deployment.
 
 ---
 
-## 1. What this kind instantiates
+## 1. What this kind is
 
-`Workspace` is the storage-backed kind the fabric exists to carry: a named
-execution/storage context (a directory tree, an SSH host, a k8s pod/PVC)
-that consumers resolve into fs+shell capabilities for their own location.
-The three parties (core §2) land here as: the **registry** the workspace
-registry service (one per deployment); the **provider** the workstation
-daemon, the cluster controller, the CI image — whatever owns the physical
-place a workspace lives; the **consumer** the pi adapter, hermes adapter,
-etc.
+`Workspace` is the storage-backed kind the fabric exists to carry. In the
+party model: the **registry** is the workspace registry service; the
+**provider** is whatever owns the physical place a workspace lives
+(workstation daemon, cluster controller, CI image); the **consumer** is the
+agent adapter.
 
-Users reach Workspaces by `resolve(Workspace, name, consumer)` → route
-descriptor (core §7.2) → adapter mints and attaches `WorkspaceEnv`.
-
-## 2. Workspace schema (v1alpha1)
+## 2. Workspace schema
 
 ```yaml
 apiVersion: twill.bitwiseoperations.ca/v1alpha1
@@ -32,36 +25,34 @@ kind: Workspace
 metadata: { name: workstation-repos, labels: { twill/workspace-class: git } }
 spec:
   owner: user:example
-  routes: []                              # §4
+  routes: []
   workspace:
-    storageBacked: true                   # core §4.3 — Workspace IS storage-backed
+    storageBacked: true                   # core §4.3
     accessMode: RWO                       # RWO | RWX — §3
     storage:
-      id: ws_01J8Z4-workstation-repos     # derived from nothing; this is a root
-      fingerprint: vol-2c4f1a             # REQUIRED; kind-picked value — §2.1
+      id: ws_01J8Z4-workstation-repos
+      fingerprint: vol-2c4f1a             # REQUIRED — kind-owned value vocab, §2.1
     hostname: workstation
     toolHints: [git, forgejo-api, pi]
     shellPolicy: full | readonly | none
-  parent: null                            # or { kind: Workspace, name: <parent> } — §2.2
 status: {}
 ```
 
-### 2.1 Fingerprint value vocabulary (the kind-owned choice)
+### 2.1 Fingerprint value vocabulary
 
-`storage.fingerprint` is kind-owned for WHAT value to populate (core §8.3's
-load-reject rule, which lives in core and is not restated here). Workspace
-kind picks: a volume UUID or filesystem UUID for `local`-backed workspaces,
-a PVC UID for `k8s-exec`-backed workspaces, the workstation's machine-id
-for `ssh`-backed workstations (content-stable across OS reinstalls of the
-same host, which is the case where you want to catch the change).
+Core §8.3 has the load-reject rule (aliasing detection) and is not
+restated here. Workspace kind picks the fingerprint *value* by route
+type:
 
-Registries apply the load-reject at (re)load; what they do on violation is
-core §8.3's consolidated rule, not business of this spec.
+- `local`-backed: the backing volume's UUID / filesystem UUID.
+- `ssh`-backed: the workstation's machine-id (content-stable across
+  reinstalls of the same host).
+- `k8s-exec`-backed: the PVC UID.
 
-### 2.2 Git worktrees: first-class children (parent/child example)
+### 2.2 Git worktrees: first-class children
 
-The canonical child example: a git worktree of a repo workspace. The child
-is its own Workspace document:
+A git worktree of a repo workspace is its own Workspace document
+(core §4.2, §4.3):
 
 ```yaml
 kind: Workspace
@@ -69,192 +60,165 @@ metadata: { name: payments-repo-feat-x }
 spec:
   owner: user:example
   routes:
-    - match: {agentLocation: cluster}
+    - match: {agentLocation: workstation}
       type: local
       path: ~/repos/payments-repo/wt/feat-x
   workspace:
     storageBacked: true
     accessMode: RWO
     storage:
-      id:        ws_01J8Z4-feat-x            # derived from parent's ws_01J8Z4 — core §4.3
-      fingerprint: vol-2c4f1a                 # matches parent's fingerprint (same volume)
+      id:        ws_01J8Z4-feat-x             # derived from parent's ws_01J8Z4-...
+      fingerprint: vol-2c4f1a                  # matches parent (same volume)
   parent: { kind: Workspace, name: payments-repo }
-status: {}
 ```
 
-Children-to-children are legal (deeper nested worktrees; no practical
-cap). Cycle detection is loader-side (core §4.2).
+Siblings are the common case (many branches = many children at depth 1);
+all siblings share one root's `storage.id` prefix *and* one fingerprint
+value; the §8.3 sibling exemption handles them.
 
-Wrong-aliasing example to avoid: the child's `storage.id` MUST differ from
-the parent's (it's a different capability view), but its `fingerprint`
-MUST match (same physical volume), so a mismatched pairing gets caught by
-the load-reject rule rather than silently accepted.
+## 3. accessMode
 
-## 3. accessMode: RWO vs RWX
+`RWO` (default) | `RWX`. Informational in v1alpha1. **v1alpha1 advisory
+rule**: adapters SHOULD warn when opening an RWO workspace whose
+`claimedBy` (from its `claimedOn` fingerprint) is non-empty, and proceed
+only deliberately; RWX offers no such warning lane. Lease mechanics
+(v2) are where `ready`-flips-on-first-claim lands.
 
-`accessMode: RWO | RWX` declares the storage's concurrency story
-(informational v1alpha1; leases formalize the mechanics in v2):
+## 4. Route types
 
-- `RWO` — single concurrent claimer (iSCSI-shaped). In v1alpha1 the
-  meaning is cooperative: consumers SHOULD check `claimedBy` (with its
-  `claimedOn` fingerprint — core §8.4) when opening an RWO workspace
-  and SHOULD warn (not block) on a second claim. The mechanical
-  "ready=false when claimed" mapping is v2-lease behavior and is
-  deferred to it.
-- `RWX` — many concurrent claimers (NFS-shaped). Claims do not turn
-  readiness off: attached + ready is valid for additional claimers.
+Kind-owned enum (core §6.2):
 
-Default is `RWO`. Kind-owned; Card has no analogue because Card is not
-storage-backed.
-
-## 4. Route types (the Workspace enum)
-
-| `type` | Mechanism | Kind-required fields | v1alpha1? |
+| `type` | Mechanism | Required kind fields | Optional kind fields |
 |---|---|---|---|
-| `local` | Direct filesystem + shell | `path` | yes |
-| `ssh` | SSH exec + SFTP | `address`, `path`; optional `user`, `port` | yes |
-| `k8s-exec` | `kubectl exec` + PVC | `pvc`, `path`; optional `namespace`, `context` — NOT a pod name | yes |
+| `local` | fs+shell on the provider's host | `path` | — |
+| `ssh` | SSH exec + SFTP | `address`, `path` | `user`, `port` |
+| `k8s-exec` | `kubectl exec` + PVC | `pvc`, `path` | `namespace`, `context` |
 
-Route types are kind-owned (core §6.2). `local`/`ssh`/`k8s-exec` are this
-kind's names. `agent` is not a v1alpha1 route type (composite rationale
-§7.1 is the delegation design sketch).
+### 4.1 k8s-exec targets a PVC, not a pod
 
-### 4.1 Why `k8s-exec` targets a PVC, not a pod
+Address stability. Pod references are a provider/adapter-side convention
+(`twill-ws-<k8sName(durable_id) of the consumer child or the provisioner—
+see the Worktree/Claim parenting convention for who owns what pod`; RFC
+1123-sanitized).
 
-Pod names are ephemeral. The route names the PVC; the *mechanism* of
-reaching the bytes (which pod mounts them) is convention-driven: the
-adapter-side convention is `twill-ws-<k8sName(storage.id)>` (RFC1123-
-sanitized, lowercase-with-dashes normalized), realized by whatever spin-up
-machinery the provider runs. Pod lifecycle is provider/extension business
-(§6); the PVC is what the route points at.
+## 5. Workspace lifecycle → status surface mapping
 
-## 5. Workspace lifecycle, mapped to the protocol status surface
+The Workspace spec owns the kind-lifecycle-*to-protocol* mapping;
 
-The kind-owned lifecycle and the `ready`-mapping into the protocol surface
-(core §8):
+| Workspace lifecycle state | `ready` | `provisionable` | `progress` |
+|---|---|---|---|
+| `cold` | `false` | `true` | e.g. `"workspace registered, no volume yet"` |
+| `provisioning` | `false` | `true` (usually) | e.g. `"cloning repo ..."`; provider may mark non-wakeable states `provisionable: false` |
+| `ready` | `true` | `false` | anything (advisory) |
+| `degraded` | `false` (see below) | `false` (usually) | recommended: provider's reason |
+| `down` | `false` | `false` | anything |
+| unknown | `false` | `false` | spec violation |
 
-| Workspace-kind lifecycle state | Maps to `ready` | Notes |
-|---|---|---|
-| `cold` | `false`, `provisionable: true` | Registered, not yet materialized; the 1000-services scenario |
-| `provisioning` | `false`, `provisionable: true` | The clone/restore/spin-up is in flight |
-| `ready` | `true`, `provisionable: false` | Materialized and no blocker to claim |
-| `degraded` | `true` + progress carries "degraded", `provisionable: false` | Attachable but provider wants you to know |
-| `down` | `false`, `provisionable: false` | Provider reachable but reports the workspace down; provider dead = `down` by TTL expiry |
-| unknown values | `false`, `provisionable: false` | Spec violation, treated as `down` |
+`degraded` is not-selecting: treat as not-ready for new consumers. (The
+provider's reason goes in `progress`.)
 
-Extensions MAY be namespaced (`k8s:fenced`, `pvc:restoring`); they map
-onto `ready:false` for consumers, and appear in `progress`.
+Namespaced extensions allowed (`k8s:fenced`, `pvc:restoring`); they
+degrade to the nearest concrete state above.
 
-**Cold workspace handling (v1alpha1 wake contract).** A `cold` workspace
-is the cheap form of the workspace — no hot volume, provider can
-trovision it when asked. Selection is cheap and non-blocking: resolve
-returns a descriptor carrying `ready:false`, `provisionable:true`,
-`progress` carrying the provider's free-form note. The **consumer's
-adapter**, seeing `provisionable: true`, polls `resolve` in a loop
-at adapter-chosen interval (e.g. 5–10s) until either (a) the status
-flips to `ready: true` (the provider finished provisioning, either
-because a previous claimer requested it or because the provider's
-own watcher saw the first claim POST) or (b) the adapter's own
-timeout elapses. Direct "wake now" endpoint calls are v2; v1alpha1
-has claim-triggered lazy provisioning and adapter-side polls as the
-full loop.
+## 6. Cold-workspace wake contract (v1alpha1)
 
-## 6. Preconditions (provider-side)
+The enterprise case: 1000 registered workspaces, most not materialized.
 
-Preconditions are the provider's materialization mechanism:
-`precondition: { steps: [...] }` at the route envelope (core §6.3).
-Execution context: the provider's environment against the route target;
-credentials ambient to the provider. Consumers are forbidden from
-executing them (core §6.3).
+E2E loop a consumer's adapter runs (and every implementer must produce):
 
-The Workspace kind's step vocabulary:
+1. `resolve(Workspace, name, consumer)` → `Attached` descriptor with
+   `ready: false, provisionable: true` (selection is cheap and
+   non-blocking; resolve never blocks on provisioning).
+2. The adapter POSTs a `Claim` document against the workspace
+   (parent = the workspace; `claimedOn` = its durable_id+fingerprint),
+   including any `parameters` the provider needs (`branch`,
+   `worktreeName`, etc.).
+3. The registry indexes the claim. The workspace's status surface now
+   includes the new claim in its `claimedBy`.
+4. **The provider polls `GET /twill/v1alpha1/claims?parent=<name>`**
+   (the provider-claim-read-path — part of the provider/registry
+   contract) and begins provisioning. As it works it pushes
+   `Workspace.statusReport` (vocabulary: `provisioning`, eventually
+   `ready`); the registry updates its cache.
+5. The adapter polls `resolve` at adapter-chosen interval (suggested
+   5–10s). The progressive descriptor returns changing `ready` values
+   (`false` → `true`); when `ready: true` arrives, the adapter mints
+   and uses the capability.
+6. On timeout the adapter gives up; the claim stays (visibility for
+   operators) until the consumer explicitly releases
+   (`DELETE`-or-release-mark of the Claim document).
+
+No special-case: cold workspaces are just "not ready yet, claim them,
+wait for provisioning to report `ready: true`," and the poll loop is
+the only thing that waits.
+
+Providers that cannot lazy-materialize should return `provisionable:
+false` and not accept claims; claims against such workspaces are invalid
+for lazy materialization purposes (the provider rejects them at
+materialization time).
+
+## 7. Preconditions (provider-side)
+
+`precondition.steps[]` per route (core §6.3). Kind vocabulary:
 
 | Step `type` | Fields | Semantics |
 |---|---|---|
-| `gitClone` | `{url, ref, credentials?}` | Ensure `path` is a clone of `url` at `ref`. No-op on match; fast-forward if `HEAD` is ancestor-of-`ref` + clean tree; **FAIL** on dirty/diverged. |
-| `worktree` | `{repo, branch, base?}` | Ensure a worktree of `repo` at `path` on `branch`. Create branch+worktree if absent; no-op on same branch/commit; **FAIL** if branch checked out in a different worktree. |
-| `pvcBind` | `{name, namespace, timeout?}` | Ensure PVC is Bound; default `timeout` 120s. |
-| `remoteMkdir` | `{}` | Ensure `path` exists (provider-side shell). |
-| `mountCheck` | `{device \| fstype}` | Verify `path` is on the expected device/fstype. |
+| `gitClone` | `{url, ref, credentials?}` | No-op on match; ff if ancestor+ref-clean; FAIL on dirty/diverged. |
+| `worktree` | `{repo, branch, base?}` | Idempotent add; FAIL on branch-checked-out-elsewhere. |
+| `pvcBind` | `{name, namespace, timeout?}` | Bind + wait; default timeout 120s. |
+| `remoteMkdir` | `{}` | Ensure path. |
+| `mountCheck` | `{device \| fstype}` | Verify fs backing. |
 
-Multi-step sequences carry their natural order: `[gitClone, worktree]`
-for branch work; `[pvcBind, gitClone, mountCheck]` for cold cluster
-workspaces.
-
-## 7. Consumers and WorkspaceEnv
-
-A successful resolve→adapter flow gives the consumer a WorkspaceEnv:
-
-```
-WorkspaceEnv :: {
-  FileSystem    # read/write/list, adapter-mapped per runtime
-  Shell         # command execution in the workspace cwd context
-  id            # = spec.workspace.storage.id (adapter-forced)
-  cwd           # the workspace's root for this capability (= route.path
-                # once preconditions have been satisfied per status)
-}
-```
-
-The **adapter** is the actor that forces `id` (core §4.3 / §7.2). Pi's
-`ExecutionEnv` is the natural first target because its contract is
-already this shape; hermes gets a `twill` terminal-backend module;
-opencode gets a config generator; cursor maps `precondition` onto
-`.cursor/worktrees.json`. (Composite rationale §6 has the full table.)
-
-Adapters treat the status's `ready` as advisory: they may attach eagerly
-and fail their own way, or wait/poll. The protocol does not standardize
-adapter wake semantics beyond §5's cold note.
+Parameters sent with a Claim (workspace-level: `branch`, `worktreeName`)
+are available to `worktree` steps by reference (`{{claim.parameters.branch}}`
+style, concrete substitution syntax is registry-implementation-owned).
 
 ## 8. The registry service (concrete surface)
 
-The concrete registry shape (abstract in core §10.3):
-
-- **One process**, YAML-watched documents, single replica.
-- **HTTP surface** (URLs owned by this spec):
-  - `GET  /twill/v1alpha1` → discovery list (core §10.3 shape)
-  - `GET  /twill/v1alpha1/<kind>/<name>` → the document
-  - `POST /twill/v1alpha1/resolve` → Attached/NoMatch/Unreachable (core §7)
-  - `POST /twill/v1alpha1/<kind>/<name>/claim` → consumer claim (core §6.3)
-  - `POST /twill/v1alpha1/<kind>/<name>/release` → consumer release (core §6.3)
-  - `POST /twill/v1alpha1/<kind>/<name>/statusReport` → provider push
-  - `GET  /twill/v1alpha1/health` → `{"documentSet": "current|stale",
-    "rejectedAt"?: ..., "reason"?: ...}` (core §8.3)
-  - `PATCH /twill/v1alpha1/<kind>/<name>` — v1-alpha; deployment-side auth.
-- **Documents:** ConfigMap or bind-mount, watched.
-- **Auth:** v1 deployment-shaped (tailnet-only service, or token header);
+- Process: one, YAML-watched, single replica.
+- HTTP surface:
+  - `GET  /twill/v1alpha1` (discovery; core §10.3 shape)
+  - `GET  /twill/v1alpha1/<kind>/<name>`
+  - `POST /twill/v1alpha1/resolve`
+  - `POST /twill/v1alpha1/<kind>/<name>/claims` (consumer: create a claim)
+  - `GET  /twill/v1alpha1/claims?parent=<name>` (provider: read claims
+    against a parent)
+  - `POST /twill/v1alpha1/<kind>/<name>/statusReport` (provider push)
+  - `GET  /twill/v1alpha1/health` (`{"documentSet": current|stale, ...}`)
+  - `PATCH /twill/v1alpha1/<kind>/<name>` (v1-alpha)
+- Auth: deployment-side in v1alpha1 (tailnet LB only, or a token header);
   `principal` self-declared.
-- **Apply:** the load-reject rule + serve-last-good behavior on violation
-  (core §8.3) — the registry keeps serving the previous valid set and
-  reports `documentSet: stale` on `/health`.
+- Load-reject / reload: core §8.3's rule — fingerprint-sibling pairs
+  un-rejected; aliasing pairs without lineage rejected; serve-last-good;
+  `/health` reports current/stale.
+- Sources: ConfigMap or bind-mount; watch them.
 
 ## 9. Deployment
 
-- **In-cluster (primary):** Deployment + PVC (`itty-nfs-flashy`, 4Gi);
-  ClusterIP for in-cluster; Tailscale LB Service for workstation
-  consumers; documents from a ConfigMap; chart lives in the helm-charts
-  repo; single replica.
-- **Not-in-cluster:** docker-compose with a bind-mount for the YAML.
-- **No operator in v1alpha1;** `status:` stays empty.
+- In-cluster: Deployment + PVC (`itty-nfs-flashy`, 4Gi); ClusterIP for
+  in-cluster; Tailscale LB for workstation consumers; documents from a
+  ConfigMap; chart lives in the helm-charts repo.
+- Not-in-cluster: docker-compose with a bind-mount.
+- No operator in v1alpha1; `status:` stays empty.
 
 ## 10. Milestones
 
-- **T1 (1–2 days):** registry process + `POST /resolve` + document watch
-  + discovery + provider-push `statusReport` surface + fingerprint
-  load-reject + Workspace kind only. First consumer: `twill` CLI making
-  HTTP calls (prints the route descriptor; not a second resolver).
-- **T2 (2–3 days):** pi adapter (`twill-pi` extension) — local + ssh
-  routes, provider-driven preconditions.
-- **T3 (2 days):** k8s-exec route + remaining step types.
-- **T4 (1 day):** hermes terminal-backend `twill`.
-- **T5 (deferred):** Card/skuld per holding note; other kinds;
-  `status:` controller; provider discovery.
+- **T1:** registry process + document watch + `resolve` + discovery + claims
+  create/read + statusReport push/pull + fingerprint reject + Workspace
+  kind only. First consumer: `twill` CLI.
+- **T2:** pi adapter (`twill-pi`) — local + ssh routes, provider-driven
+  preconditions, claim-and-poll loop.
+- **T3:** k8s-exec route + remaining step types.
+- **T4:** hermes terminal-backend `twill`.
+- **T5 (deferred):** Card/skuld (holding note); other kinds;
+  `status:` controller; Authelia OIDC; provider discovery; Claim GC;
+  RWO lease mechanics (exclusive-ready semantics).
 
-## 11. v2 sketch (not to implement from)
+## 11. v2 sketch
 
-- **Wake endpoint (provider-side)**: standardize one URL+contract for
-  "wake this workspace" so adapters don't each reinvent it.
-- **Lease lifecycle** on claims: TTL + renew + release, closing the RWO
-  second-consumer story.
-- **`agent` route type**: AWCP delegation (composite rationale §7.1).
-- **GC of ephemeral dependents** when parent is deleted; today deletion
-  is manual per core §4.2.
+- Provider wake endpoint (provider-direct materialize-now call).
+- RWO lease mechanics: first claim flips `ready: false` on an
+  already-claimed workspace for new consumers; leases have TTL + renew +
+  forced-release.
+- AgentProfile dispatch that uses claims as its lifecycle handle.
+- AWCP-informed `agent` route (composite rationale §7.1).

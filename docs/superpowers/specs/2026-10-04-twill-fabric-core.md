@@ -1,50 +1,38 @@
 # Twill fabric core — the protocol
 
-**Status:** Draft (revision 5 — provisionable + claimedOn + fingerprint exemption)
+**Status:** Draft (revision 6 — parties + status surface + Claim-first-class)
 **Date:** 2026-10-04
-**Scope:** The **agent-agnostic workspace fabric protocol only**. Nothing in
-this document is runnable. Every kind-specific spec (workspace, card, mcp,
-skill, agentprofile) **inherits this document and may not restate or redefine
-it**; disagreements resolve in this document's favor. This document is
-**authoritative** for the fabric protocol: where any sibling doc conflicts,
-this wins; kind specs, when written, may instantiate it but not redefine it.
-**Sibling rationale doc:** `2026-10-02-twill-fabric.md` (what each kind is
-for, why the fabric exists, neighboring tools).
+**Scope:** The **agent-agnostic workspace fabric protocol only**. Weakest-link
+doc: every kind spec inherits and may not restate or redefine it. This doc is
+**authoritative**; disagreements resolve in its favor.
+
+Six kinds exist in v1alpha1. `Workspace` and `Claim` are built; `Card`,
+`MCPServer`, `Skill`, `AgentProfile` are reserved or schema-pinned.
 
 ---
 
 ## 1. Purpose
 
 Twill is a typed directory of fabric objects that agent runtimes **resolve**
-into capabilities they can use. Five object kinds exist; only `Workspace` is
-built in v1alpha1. This document specifies the **invariants every kind and
-every consumer shares** — the envelope, the identity rules, matching, the
-resolution algorithm, the party responsibilities, the status surface — so
-that kind-specific specs stay small and so that adapters for one kind need
-know nothing about another kind.
+into capabilities. This document specifies the **invariants every kind and
+every consumer shares** — envelope, identity, matching, resolution, party
+responsibilities, the status surface, claims — so that kind specs stay
+small and adapters for one kind need know nothing about another.
 
 ## 2. Parties (protocol-level)
 
-There are three protocol parties. The words the protocol uses for them are
-fixed and ordinal:
-
-- **Registry** — the *yellow pages*. It knows what exists and, given a
-  consumer, *selects the route* that should apply. It does not precondition,
-  does not attach, does not manufacture object state (it forwards what
-  providers report). Like the phone book, it hands you the number; it does
-  not call the plumber.
-- **Provider** — owns and *materializes* fabric objects. The provider holds
-  the storage, runs the preconditions that make a workspace ready, reports
-  object state to the registry, and answers consumer wake/materialize calls
-  (kind-defined). Materialization is the provider's product.
+- **Registry** — the *menu*. It knows what exists and, given a consumer,
+  *selects the route* that should apply. It does not precondition, does not
+  attach, does not author object state (it forwards what providers report,
+  minus `claimedBy` which it derives from its own documents). It also does
+  not order the pizza: consumers attach to providers directly with the
+  returned route; the registry just hands out the right address.
+- **Provider** — owns and *materializes* fabric objects. Runs preconditions,
+  reports state to the registry, picks up and fulfils claims. Materialization
+  is the provider's product.
 - **Consumer** — the agent/runtime that resolves and *opens the capability*
-  against the provider. Consumers talk only to the registry until the last
-  moment, when they use the returned route descriptor to attach.
-
-The three-party split governs all of §6 (resolution) and §8 (status): the
-registry selects, the provider materializes, the consumer attaches.
-Every kind instantiates those parties in its own way (this spec owns their
-responsibilities; kind specs own their concretions).
+  against the provider. Talks only to the registry for selection and claims,
+  then to the provider for everything else.
 
 ## 3. The envelope
 
@@ -53,7 +41,7 @@ The envelope is protocol-fixed; kinds may not alter it:
 
 ```yaml
 apiVersion: twill.bitwiseoperations.ca/v1alpha1     # required; version rules in §10.1
-kind: Workspace | Card | MCPServer | Skill | AgentProfile
+kind: Workspace | Card | Claim | MCPServer | Skill | AgentProfile
 metadata:
   name: <string>          # unique within this kind
   labels: {<class keys>}  # optional
@@ -65,233 +53,151 @@ spec:
 status: {}                # reserved; controller-owned in v2, reader-ignored
 ```
 
-Protocol rules on the envelope:
-
-- **`spec.` top level carries exactly four keys:** `owner`, `routes`,
+- `spec.` top level carries exactly four keys: `owner`, `routes`,
   `<kindname>`, `parent`. All kind-specific data lives under
-  `spec.<kindname>`. This is the mechanically-decidable line between
-  protocol fields (which require a version bump to add) and kind fields
-  (which don't).
-- `apiVersion` is protocol-owned; version rules in §10.1.
-- `kind` is one of the five values above; adding kinds is a protocol version
-  bump (§10.2).
-- `metadata.name` is unique within a kind; there is no cross-kind
-  uniqueness.
-- `status` is structurally reserved: readers must treat it as opaque,
-  writers in v1alpha1 must leave it empty. Readers must not require it to
-  exist.
-- A document may be **inert**: well-formed but with no resolvable behavior
-  yet (§10.3). Inert documents are valid fabric input.
+  `spec.<kindname>`.
+- `kind` is one of six values; adding kinds is a protocol version bump.
+- `metadata.name` is unique within a kind.
+- `status` reserved: readers opaque, writers in v1alpha1 leave empty.
+- A document may be **inert** (well-formed, no resolvable behavior, listed
+  with `resolvable:false`).
 
-### 4.1 The kind spec object (`spec.<kindname>`)
+### 4.1 `spec.<kindname>`
 
-The lowercase kind name is the name of the kind's spec object: a Workspace
-document has `spec.workspace`, a Card has `spec.card`, an MCPServer has
-`spec.mcpserver`, a Skill has `spec.skill`, an AgentProfile has
-`spec.agentprofile`. The kind spec owns everything under it: its storage-
-backing declaration and durable-id (§4.3), its route-type vocabulary (§6.2),
-its route-envelope elaborations, its own fields.
-
-This rule is what lets new kinds land without touching the protocol: the
-protocol knows where to find `spec.<kindname>`; it does not know or care
-what's inside.
+The lowercase kind name is the name of the kind's spec object. All kind-
+specific data, rules, and fields live under it: durable-id rules (§4.3),
+route-type vocabulary (§6.2), kind-invented matching semantics, lifecycle
+to status-surface mappings (§8). The protocol knows where to find it; it
+does not know or care what's inside.
 
 ### 4.2 Children: `spec.parent`
 
 `spec.parent` is an optional reference to another fabric object, of any
-kind. Children are first-class objects — full documents in their own right,
-not sub-resources. Children may have children; recursion is unbounded and
-cycles are a validation error. Kind specs decide which (child-kind,
-parent-kind) crossings are legal; the protocol only fixes the reference
-shape.
+kind. Children are first-class objects, full documents in their own right.
+Children may have children; recursion is unbounded; cycles are loader-
+rejected. Kind specs decide which (child-kind, parent-kind) crossings are
+legal. Deletion is **not** auto-cascading in v1alpha1; kind specs may
+declare cascade semantics.
 
 Children are how the fabric models views over parents: a git worktree of a
-repo workspace; a Story Card of an Epic Card. Deletion is **not**
-auto-cascading in v1alpha1: deleting a parent does not delete its children
-(the wrong side of the mistake to make automatic). Kind specs may declare
-cascade semantics in their own specs later.
+repo workspace; a Story Card of an Epic Card; a Claim of its claimed
+resource.
 
 ### 4.3 Storage-backing declaration and durable id
 
-Every kind spec MUST declare `storageBacked: true|false` at
-`spec.<kindname>.storageBacked`; classification is by *declaration*, not
-inference (an object whose kind spec happens to contain a nested field
-named `storage` is the case the declaration guard protects). Storage-backed
-kinds (Workspace in v1alpha1) use `spec.<kindname>.storage.id` as the
-durable id; all others use `spec.<kindname>.id`. The durable id is minted
-once at object creation, immutable under rename, never recycled. Identity
-is protocol-required; what the id identifies is kind-defined.
+Every kind spec MUST declare `storageBacked: true | false` at
+`spec.<kindname>.storageBacked`. Storage-backed kinds (Workspace in
+v1alpha1) use `spec.<kindname>.storage.id` as the durable id; all others
+use `spec.<kindname>.id`. Minted once at creation, immutable under rename,
+never recycled. What the id identifies is kind-defined.
 
-**Derived child ids.** For storage-backed kinds, a child's `storage.id`
-MUST incorporate the parent's — e.g. a git-worktree-child of
-`ws_01J8Z4` is `ws_01J8Z4-feat-x` — so cross-object aliasing of the same
-bytes remains detectable, and the parent relationship is visible in the id
-itself. A child is a *view over* the parent's bytes (different `cwd`), not
-an alias of them — so its `storage.id` must NOT equal the parent's, but
-the fingerprints semantics apply: the child's `storage.fingerprint` matches
-the parent's (both point at the same physical volume, which is how the
-registry catches the wrong kind of alias). The parent's load-reject rule
-same-fingerprint-different-id (see §7) is the mechanism that enforces this;
-child objects do not relax it, they participate in it.
+**Derived child ids.** Storage-backed kinds: a child's `storage.id` MUST
+incorporate the parent's (e.g. `ws_01J8Z4-feat-x` is a child of
+`ws_01J8Z4-...`) and MUST differ (children are views, not aliases). A
+child's `storage.fingerprint` MUST equal the parent's (same physical
+volume). Whether parents and children share `fingerprint` (yes) while
+differing in `storage.id` is the load-reject exemption case (§8.3).
 
 Non-storage-backed kinds derive child ids by the same convention for
-navigability (Epic `cd_a9` → Story `cd_a9-2` → Task `cd_a9-2-1`); whether
-child ids are derived or free on those kinds is kind-owned.
+navigability; strictness is kind-owned.
 
 ## 5. Owner and principal
 
-Every object has **one** `spec.owner`, a subject string in the grammar
-`<scheme>:<id>` (e.g. `user:example`, `team:platform`). Required even
-for single-user deployments. v1alpha1 consumers may ignore it for access
-decisions but must preserve it in documents they create or mutate.
+`spec.owner`: a subject string `<scheme>:<id>` (e.g. `user:example`,
+`team:platform`). Required even single-user. v1alpha1 consumers may ignore
+it for access decisions; must preserve in mutations.
 
-A **principal** is the request-side claim of identity. `spec.owner` is the
-registry-side claim. The protocol keeps them separate so a v2 controller can
-bind them. **Routes are not an authorization boundary**: `principal` is
-self-declared in v1alpha1 and must be treated as untrusted; matching on
-`principal` selects configuration but does not enforce access.
+`principal` is the request-side claim; self-declared and untrusted in
+v1alpha1. **Routes are not an authorization boundary**; matching selects
+configuration, not permissions.
 
 ## 6. Routes
-
-A route is one object inside `spec.routes[]`. Routes are **per-consumer
-resolvers**: the same object yields different capabilities to different
-consumers.
 
 ### 6.1 Route envelope (protocol-fixed)
 
 ```yaml
-- match: {agentLocation: <string>, agentKind: <string>, principal: <string>}   # any subset; omitted = match all
+- match: {agentLocation: <string>, agentKind: <string>, principal: <string>}   # any subset; omitted = matches all
   type: <string>                          # route type; kind-defined enum — §6.2
   precondition: { steps: [ ... ] }        # optional, ordered — §6.3
-  # (kind-defined route fields follow)
+  # (kind-defined route fields follow — static document data only)
 ```
 
-The protocol fixes only the envelope keys: `match`, `type`, `precondition`.
-The three names are **reserved on the route envelope** — kind-defined route
-fields may not reuse them. Every other key is kind-defined. `match` is
-optional; `match: {}` and absent `match` both mean "matches every consumer."
-Unknown `match` keys are a spec violation, and routes may not list an
-empty-string value in `match`.
+### 6.2 `type` value
 
-### 6.2 Route `type` value
-
-The `type` value is a string. **The set of valid route types is owned by
-the kind spec.** The protocol does not enumerate `local`/`ssh`/`k8s-exec`
-(Workspace's set) or any others. Each kind spec MUST publish its `type`
-vocabulary as a closed, named enum; on selection, a route whose `type` is
-not in the serving kind spec's enum is per-route invalid and selection
-continues (§7). Onboarding a new kind never requires a protocol version
-bump.
-
-A convention, not a rule: kinds whose routes concern the same physical
-mechanisms SHOULD reuse the same `type` names so the fabric reads
-coherently.
+Kind-owned closed enum. The protocol does not enumerate any values. Each
+kind spec MUST publish its enum; unknown `type` at resolution = per-route
+invalid.
 
 ### 6.3 `precondition.steps[]`
 
-A route may declare `precondition`: an **ordered list** of provisioning
-steps the **provider** runs *before* the workspace is reported ready. Each
-step has a kind-defined `type` and fields. Steps are idempotent;
-short-circuit on the first failure. The protocol fixes only the existence,
-order, and ownership (provider, not consumer-and-not-registry) of
-precondition steps: a resolved route descriptor carries the steps
-informationally; consumers MUST NOT execute them (§8 makes the "report
-readiness" mechanism that obviates consumer execution).
-
-**Claim registration.** A consumer that has resolved and intends to open
-a capability records its claim by sending its consumer tuple back to the
-registry (`POST /twill/v1alpha1/<kind>/<name>/claim`, body = the consumer
-tuple). The registry updates the per-route `claimedBy` in its status
-cache (with `claimedOn: <the document's storage.fingerprint>`), and
-the provider's next statusReport reflects the claim. `POST release`
-ends the claim. The `claimedBy` element type is `{consumer, claimedOn}`;
-the "claimed" name was chosen over "attached" specifically so the same
-term covers workspaces, physical-volume claims, and later cards.
+An ordered list of provisioning steps the **provider** runs *before* the
+object is reported ready. Kind-defined `type` and fields. Idempotent;
+short-circuit on failure. **Consumers MUST NOT execute steps** — what the
+descriptor carries is informational. This is the "don't let the consumer
+rebuild what the provider was supposed to materialize" rule; when the
+consumer has to do it itself, the provider is just leasing bytes.
 
 ## 7. Resolution and matching
 
-Resolution maps `(kind, name, consumer)` to one of three outcomes: an
-`Attached` route descriptor, `NoMatch`, or `Unreachable`. The important
-shape: resolution is the **registry's selection**, not the consumer's
-attach. *Descriptor pinning:* the top-level keys of the Attached
-descriptor (`kind`, `name`, `durable_id`, `route`, `status`) are
-protocol-closed; the `route` envelope keys (`match`, `type`,
-`precondition`) are protocol-closed; route *kind* fields are open
-(kind-owned) but must be **static document data** — route fields
-describing data present in the stored document, never per-attach
-dynamic state, never claim tokens, never lease grants. Kinds may not
-mint protocol semantics through kind-field additions on returned routes. The algorithm:
+`resolve(kind, name, consumer) -> Attached | NoMatch | Unreachable`.
+
+The registry-side algorithm (selection, not attach; no precondition
+execution):
 
 ```
 resolve(kind, name, consumer) -> Attached | NoMatch | Unreachable:
   obj    <- registry.get(kind, name)
-  routes <- obj.spec.routes.filter(matches(r.match, consumer))        # §7.1
+  if obj is missing: return NoMatch(kind, name, consumer)
+  routes <- obj.spec.routes.filter(matches(r.match, consumer))     # §7.1
   if routes is empty: return NoMatch(obj, consumer)
   errors <- []
   for r in routes (in declared order):
-    if r.type not in kind spec's enum:
-      errors.append((r, "unknown route type")); continue
-    st <- registry.statusFor(obj, r)                                  # §8
-    if not st.selectable:                                             # kind-mapped
-      errors.append((r, st.reason)); continue
-    return Attached(descriptor(obj, r, st))                           # §7.2
+    if r.type not in kind spec's enum: errors.append((r, "unknown route type")); continue
+    st  <- registry.statusFor(obj, r)                              # §8
+    if not st.selectable: errors.append((r, "not selectable")); continue
+    return Attached(routeDescriptor(obj, r, st))
   return Unreachable(obj, consumer, errors)
 ```
 
-Rules:
-
-- **Three distinct results.** `NoMatch` = no route selected this consumer.
-  `Unreachable` = at least one candidate, none survived. The last result
-  carries per-route errors so callers can tell whether the whole set
-  failed or only earlier candidates did.
-- **Order before readiness.** A route lower in the list is selected only
-  if every earlier matching route was not selectable. Matching is not a
+- Three distinct results, per-route errors on Unreachable.
+- **Order before readiness**: a route lower in the list is selected only if
+  every earlier matching route was not selectable. Matching is not a
   health check.
-- **Selectability, not reachability.** The registry does not probe; it
-  consults the status surface (§8) for the route's most-recent reported
-  state. Whether that's "selectable" is kind-mapped (for Workspace, the
-  lifecycle map §8.2 documents is the answer).
-- **No attach, no precondition execution in the registry path.** The
-  returned descriptor informationally carries the route (including its
-  `precondition`); consumers MUST NOT execute the steps (§6.3). What the
-  consumer does *next* — wake/then-attach — is the consumer + provider
-  handshake, and the registry is not in it.
-- **Resolver portability.** Given the same documents, the same consumer
-  declaration, and the same status observations, two resolvers (registry
-  service; an in-adapter fallback) MUST make the same selection. Live
-  observations legitimately differ over time; the selection rule must
-  not.
+- **Selectability, not reachability**: the registry consults the status
+  surface (§8); what "selectable" means is kind-mapped. Selectability is
+  `st.selectable := st.ready OR st.provisionable` (degraded implies
+  selectable via `ready: true`; cold implies selectable via
+  `provisionable: true`).
+- **Static route data**: returned `route` is a verbatim copy from the
+  stored document (no injected fields, no per-attach dynamic data).
+- **Descriptor pinning**: top-level keys (`kind`, `name`, `durable_id`,
+  `route`, `status`) are protocol-closed; route-envelope keys are
+  protocol-closed; route kind-fields are kind-owned but must be static
+  document data.
 
-### 7.1 Matching semantics
+### 7.1 Matching
 
-Matching between a route's `match` and a consumer is **exact string
-equality on every key `match` specifies**; the consumer's declaration
-supplies `agentLocation`, `agentKind`, `principal` (each a string, each
-required, each possibly empty). A route matches iff every key it lists
-equals the consumer's value for that key. No wildcards, no case folding,
-no regexes.
+Exact string equality on every key `match` specifies. Consumer declares
+`agentLocation`, `agentKind`, `principal` (all required, possibly empty).
+Empty in `match` is a violation. No wildcards, no case folding, no
+version-suffix wildcards.
 
-**The empty-string consumer.** A consumer may declare any field as `""`
-(anonymous/default; a consumer with no principal is `principal: ""`). Empty
-consumer values are real, matchable values. Conversely, **a route may not
-list an empty string in `match`** (`match: {principal: ""}` is a spec
-violation): `""` is the sentinel for "absent," and making the sentinel a
-matchable value would double its meaning.
+The empty-string consumer: consumers may send `""` (anonymous); the
+sentinel is not matchable, so routes may not target anonymous consumers
+explicitly. (Principal-less consumers match only routes that don't list
+`principal`.)
 
-**Guidance (non-normative):** versioned `agentKind` values in routes are a
-footgun; match on the runtime family (`pi`, `hermes`).
+Match guidance: match on runtime family (`pi`, `hermes`), not versioned
+`pi/0.99.1`.
 
 ### 7.2 The Attached descriptor
-
-The registry's `Attached` is a *selection*, not a capability:
 
 ```json
 {
   "kind": "Workspace",
   "name": "workstation-repos",
   "durable_id": "ws_01J8Z4-workstation-repos",
-  "route": { "match": {...}, "type": "ssh", "address": "...", "path": "...",
-             "precondition": {"steps": [...]} },
+  "route":   { /* verbatim from the document */ },
   "status": {
     "ready": true,
     "provisionable": false,
@@ -303,192 +209,175 @@ The registry's `Attached` is a *selection*, not a capability:
 }
 ```
 
-Consumers use the `status.progress` vocabulary to convey kind-specific
-state semantics to their own logs/UIs; consumers do not parse it. The
-adapter is the actor that turns this descriptor into a capability (for
-Workspace: `WorkspaceEnv`), and is responsible for stamping
-`cap.identity = durable_id` (§4.3).
+The adapter turns this into a capability and stamps
+`cap.identity = durable_id`.
 
 ## 8. Status surface: providers report; registry forwards
 
-The registry never authors readiness. The surface is deliberately tiny and
-generic so it covers every kind:
+Protocol-owned shape — six fields, closed:
 
-| Field | Type | Protocol meaning |
+| Field | Type | Meaning |
 |---|---|---|
-| `ready` | bool | "a consumer may attach now" (kind-mapped from the provider's kind lifecycle) |
-| `provisionable` | bool | "the provider can lazily materialize this on demand" (kind-mapped; Workspace's `cold` maps to `provisionable: true`; Card always `false`) — machine-readable signal, replacing the rev-4 habit of adapters parsing `progress` |
-| `claimedBy` | `[consumers]` | who currently holds a claim (empty = unclaimed). Each claim carries `claimedOn: <fingerprint>` (see §8.4) |
-| `progress` | string | kind-owned free-form text for why/how (cold / restoring / cloned-at-abc123 / ...) — consumer-visible, never parsed (advisory only). The kind spec MAY publish an advisory vocabulary adapters should not rely on |
-| `asOf` | rfc3339 | the provider-supplied observation time |
-| `source` | `live` \| `cached` | registry-set: whether this observation is live-queried or from cache |
+| `ready` | bool | "a consumer may attach now" (kind-mapped from the provider's lifecycle) |
+| `provisionable` | bool | "the provider can lazily materialize on demand" (kind-mapped) |
+| `claimedBy` | `[consumers]` | who currently holds claims (derived from Claim documents — see §9) |
+| `progress` | string | kind-owned free-form text for humans; advisory, never parsed |
+| `asOf` | rfc3339 | the provider-reported observation time |
+| `source` | `live` \| `cached` | registry-set: which side of the cache this observation came from |
 
-That's the entire protocol-owned status shape. `ready` and `claimedBy` are
-the two the protocol *enforces*; the rest is the flavor.
+`ready` and `claimedBy` are the protocol-enforced pair. `claimed` is the
+name over `attached` deliberately: a Card is claimed, a PV is claimed, a
+workspace is claimed — the vocabulary spans kinds.
 
-`claimed` is the name over `attached` deliberately: a Card is claimed, a PV
-is claimed, a workspace is claimed; the word spans kinds. `claimedBy` is a
-list, not a boolean, for lease v2 compatibility and RWX-shared-attachment
-visibility.
+`ready` and `provisionable` are kind-mapped: the kind spec documents which
+of the provider's internal lifecycle states map onto `true`/`false` on
+each. (Core does not enumerate mapping values — that's the kind's business.
+Rule of thumb: cold ⇒ provisionable; ready ⇒ ready; dead ⇒ neither.)
 
-### 8.4 Claims occupy the storage, not the route
+**Staleness and dead providers.** A provider that fails to answer within
+the registry's query timeout yields the cached entry with
+`source: cached`. Stale entries on selection are `ready: false`,
+`provisionable: false`; the descriptor still carries the cached
+`progress`/`asOf` so adapters can judge. Claims are *not* erased by
+staleness: `claimedBy` is document-derived (§9), not provider-derived,
+so provider hang does not vanish existing claims.
 
-Each `claimedBy` element is `{consumer, claimedOn: <fingerprint>}` —
-the **fingerprint** of the storage the claim occupies, not the route
-the client used to reach it. This is the rule that makes exclusivity
-meaningful across views: two Workspaces aliasing one volume have different
-routes but the *same* fingerprint, so their claims look at each other;
-this is what makes an RWO second-consumer story consistent across
-derived children (parent and worktree-child share a fingerprint).
+The cache has a TTL, kind-spec-tunable (v1alpha1: 60s).
 
-`ready` is kind-mapped: the kind spec documents which of the provider's
-internal states map to `ready: true`. For Workspace in v1alpha1 (see the
-workspace kind spec §5): `provisioning`/`cold`/`degraded` map to
-`ready: false`; `ready` maps to `ready: true`; `down` and unknown values
-map to `ready: false`. A provider may map multiple lifecycle states onto
-the same protocol bool — the RWO-example is the canonical one.
+## 8.4 Claims occupy the storage, not the route
 
-`claimedBy` on the *status surface* describes the route's current claimed
-state for both access modes (claim on an RWO route = "one consumer holds";
-claim on an RWX route = "the shared-consumer set").
+A claim's occupancy identity is `claimedOn: {fingerprint, durable_id}` —
+the fingerprint of the storage the claim occupies, plus the durable id of
+the object it was claimed against. For storage-backed kinds the
+fingerprint is the level exclusivity operates at: two Workspaces with
+the same fingerprint see each other's claims regardless of which route
+either consumer resolved through. `claimedOn` is what makes RWO
+exclusive across views (including parent+child views of the same pool).
+Non-storage-backed kinds use the durable id.
 
-### 8.1 Provider interface for status
+## 9. Claims are first-class children
 
-Providers are reachable by the registry on a configured-by-deployment
-address surface (v1alpha1: registry-side YAML carries the provider handle
-per Workspace; discovery is v2). The registry either polls the provider
-(`GET /status`, short timeout, falls back to cache) or accepts pushes
-(`POST <registry>/<kind>/<name>/statusReport`, deployment-token-auth).
-Both transports carry the same JSON shape.
+A claim is a document of `kind: Claim`, created by the consumer's adapter
+and registered in the registry like every other document. This is the
+PVC-against-StorageClass pattern, done over the fabric:
 
-The cache has a TTL, kind-spec-tunable (v1alpha1: 60s). A status entry
-older than the TTL is used with `source: cached`.
+```yaml
+apiVersion: twill.bitwiseoperations.ca/v1alpha1
+kind: Claim
+metadata: { name: claim-ws-01J8Z4-feat-x-pi-session-a7 }
+spec:
+  owner: user:example
+  routes: []                                  # claims don't route
+  claim:
+    storageBacked: false
+    id: cl_...
+    parameters:
+      branch: feat-x
+      worktreeName: feat-x                    # parameters the provider
+                                              # materializes from
+    claimedOn: {fingerprint: vol-2c4f1a, durable_id: "ws_01J8Z4-feat-x"}
+  parent: { kind: Workspace, name: payments-repo-feat-x }
+status: {}
+```
 
-**Staleness and selection.** A provider that fails to answer within the
-registry's query timeout is per-route-unselectable on the *freshness*
-question (registry returns the *cached* status with `source: cached`
-and lets the consumer judge), BUT selection treats a stale entry as
-`ready: false` — the resolver does not pretend freshness it can't
-assert. This is the one-rule version of the dead-provider story: the
-registry always answers, the status is honest about how old it is,
-and failure modes read as "not ready" not "no data".
+Rules:
 
-### 8.2 Caching mode and the "dead-provider" case
+- Claims are first-class children, `spec.parent` is the claimed resource.
+- `spec.claim.parameters` is kind-defined for the claimed kind (Workspace's
+  parameters are things like `branch`, `worktreeName`; k8s-exec parents
+  accept PVC-ish parameters; other kinds define theirs).
+- `claimedOn` carries fingerprint + durable_id (§8.4).
+- Claims are **document-derived**: the registry derives `claimedBy` from
+  all un-released Claim documents of a given `claimedOn` fingerprint —
+  the provider's statusReport updates `ready`/`provisionable`/`progress`/
+  `asOf` but never overwrites `claimedBy`.
+- **Release**: consumers release by deleting their Claim document (or
+  marking its `.spec.claim.released: true` in v1alpha1 without a delete
+  endpoint). The registry's next status surface computation removes it
+  from `claimedBy`.
+- Claims that reference missing parents, missing releases, or parameters
+  conflicting with already-loaded children are loader-rejected.
+- **v1alpha1 claims are advisory**: there is no enforcement that a second
+  consumer may not proceed against a `claimedOn` owned by another claim;
+  adapters SHOULD warn; RWO lease mechanics are v2. Claims are the
+  *visibility* mechanism (who's working where); enforcement layers later.
+- Claim documents persist until released; crashed consumers' claims
+  remain until operator cleanup (v1alpha1 does not auto-GC claims).
 
-The registry's status answer is the **fresher of** the live query (if the
-provider answers within its timeout) and the latest cache. The `source`
-field in the descriptor carries which; consumers can decide how to treat
-a stale `ready` (an entry from 2 hours ago with `source: cached` is
-judged by the adapter, not hidden).
+The provisioning trigger uses this mechanism: a claim whose `claimedOn`
+object is currently `provisionable: true` causes the *provider* to begin
+materialization as soon as the claim is visible through the provider's
+claim-read path (see §11).
 
-### 8.3 Load-time and reload-time reject (consolidated)
-
-The registry MUST reject the document set on (re)load if any two documents
-share a populated `storage.fingerprint` with different `storage.id`
-**unless the two are in a `spec.parent` ancestor/descendant chain**
-(parent/child pairs are the *declared* alias: derived children share the
-parent's fingerprint on purpose, they are the family carrying one view
-over the same bytes, and rev 3 unwittingly rejected its own canonical
-example without this exemption). Two documents that share fingerprint,
-differ in `storage.id`, and are NOT in a parent-chain are rejected —
-that's the actual corruption case the rule exists to stop.
-
-The (re)load-time semantic: on reject, the registry serves the
-**last-good document set** (no hard exit; single-replica availability
-prevails), reports its own degraded surface, and logs the rejection.
-The "serve last-good, don't outage on a bad config push" rule is the
-actual availability contract.
-
-Health surface the registry exposes (**both cases**, not only failure):
-`GET /twill/v1alpha1/health` returns `{"documentSet": "current"}` when
-the served set is fresh, or `{"documentSet": "stale", "rejectedAt":
-..., "reason": ...}` when serving last-good after a rejected load.
-
-Cold-start-with-rejected-set: serve the **empty** registry, mark
-`documentSet: stale`, log the rejection. (Availability > correctness for
-the single-replica service; the operator treats empty+tale as the signal
-to fix the document source.)
-
-Kind specs decide what "the document set" means (the watched ConfigMap,
-the bind-mount tree, or both).
-
-## 9. Persistence and transport are out of scope (deliberately)
-
-This protocol does not specify how documents are stored or served. The
-registry's YAML documents are the source of truth; ConfigMap vs file tree
-vs CRD is the registry service's decision. The protocol only requires doc
-shape, resolution behavior, discovery shape, and the status surface.
+Claim ownership in v1alpha1: the registry authors `claimedBy` from its
+Claim documents; the provider polls the registry's claims read-path;
+the consumer's adapter is responsible for release.
 
 ## 10. Versioning and discovery
 
 ### 10.1 Version policy
 
-`apiVersion: twill.bitwiseoperations.ca/v1alpha1` permits, without a version
-bump: adding fields inside `spec.<kindname>`; adding or refining kind-
-defined route types; refining kind-specific matching-relevant semantics
-where the protocol leaves them open; adding values to the provider's
-`progress` vocabulary (it is free-form).
+`apiVersion: twill.bitwiseoperations.ca/v1alpha1` permits additive changes
+without a version bump: new fields *anywhere except as-called-out-below*;
+new values in kind-owned vocabularies; new namespaced extensions in
+`progress`; new kind-owned route types; new status fields (additive:
+readers MUST ignore unknown status fields); new claims of existing kinds.
+v1alpha1 does **not** permit: removing or renaming any of the four
+envelope keys; changing the shape of `match`; changing the match selector
+dimensions; changing the durable-id rule; changing the `precondition`
+envelope; changing the Attached descriptor's closed top-level keys;
+subtracting status fields; changing `claimedOn` shape. Any such change
+is a new `apiVersion`.
 
-v1alpha1 does **not** permit: adding/removing/renaming any of the four
-`spec.` top-level keys; adding consumer dimensions to the match selector;
-changing matching semantics; changing the durable-id path rule; adding
-fields to the status surface (§8's table); making `status` meaningful to
-readers; adding fields to the `Attached` descriptor's closed top-level
-(`kind`, `name`, `durable_id`, `route`, `status`); changing the
-`match`/`type`/`precondition` route envelope shape. Any such change is a
-new `apiVersion`.
+v1alpha1 is pre-release: payload shapes may tighten between iterations;
+readers MUST tolerate unknown fields.
 
-### 10.2 Enum policy (kinds)
+### 10.2 Kinds
 
-The five v1alpha1 kinds are protocol-fixed. Adding a new kind is a
-protocol version bump. (Kind-defined route types and kind spec fields do
-not trigger this.)
+Six kinds are protocol-fixed: `Workspace`, `Card`, `Claim`, `MCPServer`,
+`Skill`, `AgentProfile`. Adding a kind is a version bump.
 
 ### 10.3 Discovery
 
-Abstract shape — a list of object references:
+Abstract shape:
 
 ```
 { kind: <string>, name: <string>, durable_id: <string>, resolvable: bool,
   parent?: { kind: <string>, name: <string> } }
 ```
 
-`resolvable` is registry-side and per-object: `true` iff the object's kind
-has a registered kind-runner and `spec.routes` is non-empty. Discovery
-lists **every object the registry holds, inert included**. The concrete
-transport (HTTP, file walk, CLI output) is kind-spec/registry-service
-business; this document fixes only the abstract shape.
+`resolvable` per registry-side evaluation: kind has a registered kind-
+runner and routes are non-empty. Discovery lists every document held by
+the registry, inert included.
 
-## 11. Non-goals (restated in protocol terms)
+## 11. Persistence and transport are out of scope (deliberately)
 
-- Not a workflow engine: no state machines, no transitions.
-- Not a secret manager: credential refs are pointers.
+The protocol does not specify how documents are stored or served.
+Registry-side implementation details (the YAML-watch file source, the
+in-memory or on-disk index, the provider-claim-read-path shape) belong to
+the registry-service spec in the workspace kind spec, not to core.
+
+## 12. Non-goals
+
+- Not a workflow engine.
+- Not a secret manager.
 - Not an agent runtime.
-- Not a delegation protocol: AWCP inputs live in the composite rationale
-  (`2026-10-02-twill-fabric.md` §7.1) and land in whatever kind spec
-  claims them.
+- Not a delegation protocol (AWCP is a v2 design input in the composite
+  rationale).
 
 ## Appendix A. Terms
 
-- **Capability** — the kind-specific thing a consumer gets on a successful
-  resolver→adapter flow (for Workspace: `WorkspaceEnv`; not a protocol
-  concept).
-- **Consumer** — the tuple `{ agentLocation, agentKind, principal }` making
-  a resolve call; self-declared, untrusted in v1alpha1.
-- **Provider** — owns + materializes + reports state for fabric objects.
-- **Registry** — selects routes + serves the status surface; never authors
-  readiness.
-- **Durable id** — per §4.3: `spec.<kindname>.storage.id` (storage-backed)
-  or `spec.<kindname>.id` (others); minted at creation, immutable.
-- **Inert object** — a well-formed document with no resolvable behavior
-  (§10.3's `resolvable: false`).
-- **Storage-backed kind** — `spec.<kindname>.storageBacked: true`; incurs
-  the write-serialization invariant of §4.3 and the fingerprint reject
-  rule of §8.3 (v1alpha1: Workspace).
-- **Claimed / claimedBy** — the protocol's name for "currently has consumers
-  attached" (chosen over "attached": a Card is claimed, a PV is claimed,
-  a workspace is claimed — the word spans kinds).
-- **Parent / child** — §4.2's first-class object reference; children are
-  full objects in their own right; cycles are rejection.
-- **Route descriptor** — the `Attached` payload of §7.2: a selection, not
-  a capability.
+- **Capability** — the kind-specific thing an adapter mints after
+  resolution (not a protocol concept).
+- **Consumer / Provider / Registry** — §2's three parties.
+- **Durable id** — §4.3.
+- **Inert** — §10.3's `resolvable: false`.
+- **Child** — §4.2.
+- **Claim** — a first-class child (kind `Claim`) of a claimed resource;
+  visibility and the lazy-provisioning trigger.
+- **Claimed / claimedBy** — derived from Claim documents; "has consumers"
+  in kind-spanning language.
+- **ClaimedOn** — occupancy identity `{fingerprint, durable_id}` (§8.4).
+- **Route descriptor** — §7.2's Attached payload.
+- **Selectable** — `ready OR provisionable`, kind-mapped (§7).
+- **Storage-backed** — §4.3 (v1alpha1: Workspace).
