@@ -70,13 +70,15 @@ complements rather than competes with transport-level protocols such as AWCP
 
 ## 2. Objects in the registry
 
-Five object kinds. Two are v1; three are **schema-reserved** (the fields exist,
-no behavior yet, land when their extension does).
+Five object kinds. One is v1 (`Workspace`); four are **schema-reserved** (the
+fields exist, no behavior yet, land when their extension does). Card's schema
+is pinned (see `../research/2026-10-04-twill-card-holding-note.md`) but its
+implementation is deferred — see §0.0 and §4.
 
 | Kind | v1? | What it resolves to | Notes |
 |---|---|---|---|
 | `Workspace` | **Yes** | An `ExecutionEnv`-shaped capability for the requesting agent's location | The core object. §3. |
-| `Card` (skuld) | schema only | A work item with repo_refs, workspace_ref, spec, claim state | Deferred; see holding note (`../research/2026-10-04-twill-card-holding-note.md`) |
+| `Card` (skuld) | schema only | A work item under `spec.card` (id, state, repo_refs, spec_ref, claim state) | Deferred; see holding note (`../research/2026-10-04-twill-card-holding-note.md`) |
 | `MCPServer` | reserved | Endpoint + credential profile per agent location | "my searxng" everywhere, no per-agent config drift |
 | `Skill` | reserved | Versioned instruction bundles, registry-served | alternative to "superpowers belongs to pi, LCM to hermes" |
 | `AgentProfile` | reserved | Runtime + model + host + workspace for subagent dispatch | the remote-implementer thing in §7 |
@@ -87,24 +89,14 @@ features, not protocol revolutions.
 
 ### 2.1 Common shape
 
-All five kinds follow one form (CRD-forward):
-
-```yaml
-apiVersion: twill.bitwiseoperations.ca/v1alpha1
-kind: Workspace | Card | MCPServer | Skill | AgentProfile
-metadata:
-  name: <string>
-  labels: {<class keys>}
-spec:
-  storage: { id, fingerprint }      # durable identity (workspaces/cards)
-  owner: <subject>                  # day-one ACL, not boolean
-  routes: []                        # ordered preferred routes per consumer selector
-  profile: { toolHints, shellPolicy, ... }
-status: {}                          # controller-owned in v2, absent in v1
-```
-
-The `owner` field is not optional even in v1. It costs a string and saves a
-migration when multi-user lands (Authelia as IdP).
+All five kinds follow one form (CRD-forward). The concrete envelope is
+owned by `2026-10-04-twill-fabric-core.md` (§2): top-level `spec.` carries
+`owner`, `routes`, and `spec.<kindname>` (the kind's own data, including its
+durable id); details there. The load-bearing constraints for this document:
+`owner` is required from day one (a string now vs an ACL migration later);
+`status` is reserved (readers must treat it as opaque; writers in v1alpha1
+must leave it empty); `storage.id` is present on storage-backed kinds and
+carries the write-serialization invariant (fabric-core §3).
 
 ---
 
@@ -120,9 +112,13 @@ metadata:
   labels:
     twill/workspace-class: git        # git | shell | media | data
 spec:
-  storage:
-    id: ws_01J8Z4-workstation-repos   # durable; env-id serialization keys on this
-    fingerprint: ""                   # v2: volume UUID / machine-id, controller-verified
+  workspace:
+    storage:
+      id: ws_01J8Z4-workstation-repos # durable; env-id serialization keys on this
+      fingerprint: ""                 # v2: volume UUID / machine-id, controller-verified
+    hostname: workstation
+    toolHints: [git, forgejo-api, pi]
+    shellPolicy: full                 # full | readonly | none
   owner: user:example
   routes:                             # ORDERED; first matching + reachable wins
     - match: {agentLocation: workstation}
@@ -132,13 +128,10 @@ spec:
       type: ssh
       address: workstation.tailnet.example.test
       path: /home/example/repos
-    - match: {}
-      type: agent                     # dial-out brokered route (v2)
-      agentRef: workstation-main
-  profile:
-    hostname: workstation
-    toolHints: [git, forgejo-api, pi]
-    shellPolicy: full                 # full | readonly | none
+    # v2 sketch (AWCP-style delegation, see §7.1). Not a v1alpha1 route type.
+    # - match: {agentLocation: anywhere}
+    #   type: agent
+    #   lease: { ttl: 3600, access: read-write }
 status: {}
 ```
 
@@ -149,10 +142,12 @@ status: {}
 | `local` | Direct filesystem + shell | **yes** |
 | `ssh` | SSH `exec` + SFTP for file ops | **yes** |
 | `k8s-exec` | `kubectl exec` + PVC | **yes** |
-| `agent` | Workspace delegation to a remote executor — lease-bounded, executor may narrow terms (AWCP-compatible, see §7.1) | reserved for v2 |
 
-`agent` is reserved so a workspace-agent registration doesn't need a schema
-bump. Unimplemented in v1.
+These three are the Workspace kind's route-type vocabulary in v1alpha1. (The
+fabric core protocol fixes only the route *envelope*; each kind owns its own
+`type` set — see fabric-core §5.2.) The `agent` route type from earlier
+drafts is **not** a v1alpha1 route; the delegation idea it gestured at lives
+on in §7.1 as a v2 design sketch informed by AWCP.
 
 ### 3.3 **Provisioning is a first-class route concern** ← key decision
 
@@ -185,31 +180,38 @@ Idempotent. Run once per claiming connection, or per lease (v2). This makes the
 
 pi-durable serializes `edit`/`write` by **env `id` + path**. Any two
 `ExecutionEnv`s resolving to the same physical storage MUST mint envs with the
-same `storage.id`. Renaming a workspace does NOT change `storage.id`. This is
-the single load-bearing rule of workspace routing; adapters for runtimes
-without this concept (hermes, opencode) mint their ids from `spec.storage.id`
-so cross-runtime serialization still works when two runtimes share one backing
-volume.
+same `storage.id` (`spec.workspace.storage.id`). Renaming a workspace does NOT
+change `storage.id`. This is the single load-bearing rule of workspace
+routing; adapters for runtimes without this concept (hermes, opencode) mint
+their ids from `spec.workspace.storage.id` (fabric-core §3 makes the
+**adapter** the responsible actor) so cross-runtime serialization still works
+when two runtimes share a backing volume.
 
 ### 3.5 Resolution algorithm
 
+The concrete resolution algorithm (`resolve(kind, name, consumer)`) and its
+three-result shape (Attached / NoMatch / Unreachable) is owned by
+`2026-10-04-twill-fabric-core.md` §6. The load-bearing shape:
+
 ```
-resolve(workspaceName, consumer) -> Result<AttachedWorkspace>:
-  ws     <- registry.get(Workspace, workspaceName)
-  routes <- ws.spec.routes.filter(r -> matches(r.match, consumer))
-  for r in routes:
+resolve(Workspace, name, consumer) -> Attached | NoMatch | Unreachable:
+  ws     <- registry.get(Workspace, name)
+  routes <- ws.spec.routes.filter(matches(match, consumer))   # exact-string only
+  if routes is empty: return NoMatch
+  for r in routes (in declared order):
     if not reachable(r): continue
-    run r.precondition?            # idempotent
-    env <- adapter.attach(r)       # ExecutionEnv-shaped capability
-    if env.storage.id != ws.spec.storage.id: env.storage.id = ws.spec.storage.id
-    return env
-  return Unreachable(routes)
+    for step in r.precondition.steps: run step; if fail, next route
+    env <- adapter.attach(r)                                  # ExecutionEnv-shaped
+    env.identity = ws.spec.workspace.storage.id               # forced, always
+    return Attached(env)
+  return Unreachable(per-route reasons)
 ```
 
-`consumer` = `{ agentLocation, agentKind, principal }` —
-`agentLocation` is a self-declared string (`workstation`, `cluster`,
-`laptop-lan`); `agentKind` is runtime info (`pi/0.99.1`, `hermes/0.21.1`);
-`principal` is the authenticated subject (v2 auth).
+The `consumer` tuple is `{ agentLocation, agentKind, principal }`, each a
+string. For Workspace work the useful route-matching knobs are
+`agentLocation` (self-declared string names like `workstation`, `cluster`,
+`laptop-lan`) and the runtime family (match on `pi` or `hermes`, not
+versioned `pi/0.99.1` — see fabric-core §6.1 matching guidance).
 
 Resolution is deliberate per-consumer: the same workspace name can yield a
 local FS env for pi on the workstation and an SSH env for the twill-harness
@@ -235,15 +237,19 @@ Do not implement Card from this document.
 
 - **Shape:** one process, config-file-backed (YAML list of CRD-shaped documents,
   watched), SQLite index for queries. In-cluster Deployment + PVC, single replica.
-- **Exposes:** `GET/PATCH /twill/v1alpha1/<kind>/<name>`, `POST resolve` (§3.5,
-  because resolution involves per-consumer route evaluation that shouldn't be
-  re-implemented in every adapter).
+- **Exposes:** `GET/PATCH /twill/v1alpha1/<kind>/<name>`, `POST resolve`
+  (concrete shape of the abstract resolution in fabric-core §6, kept in the
+  registry because route evaluation shouldn't be re-implemented in every
+  adapter).
 - **Auth:** v1 none (private, Authelia-fronted or tailnet-only + token header).
   Schema carries principal from day one.
 - **Sources (v1, both static):** bundled YAML config from a ConfigMap; in-cluster
   operator watch is v2.
-- **Discovery:** `GET /twill/v1alpha1` lists object kinds (so adapters can
-  discover what the fabric knows).
+- **Discovery (abstract, owned by fabric-core §7.3):** a list of object
+  references with `{ kind, name, durable_id, resolvable }`, including inert
+  objects (`resolvable: false` when a kind has no registered kind-runner or
+  routes are empty). The concrete transport (HTTP, file walk, CLI output) is
+  the registry service's implementation decision in the workspace kind spec.
 
 ## 6. Runtime compatibility survey (drove §3.3 / §3.4)
 

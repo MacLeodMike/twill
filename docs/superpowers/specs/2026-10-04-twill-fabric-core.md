@@ -1,11 +1,13 @@
 # Twill fabric core — the protocol
 
-**Status:** Draft
+**Status:** Draft (revision 2, post-review)
 **Date:** 2026-10-04
 **Scope:** The **agent-agnostic workspace fabric protocol only**. Nothing in this
 document is runnable. Every kind-specific spec (workspace, card, mcp, skill,
 agentprofile) **inherits this document and may not restate or redefine it**;
-disagreements resolve in this document's favor.
+disagreements resolve in this document's favor. This document is
+**authoritative** for the fabric protocol: where any sibling doc conflicts,
+this wins; kind specs may instantiate it but not redefine it.
 **Sibling rationale doc:** `2026-10-02-twill-fabric.md` (what each kind is for,
 why the fabric exists, neighboring tools).
 
@@ -15,243 +17,321 @@ why the fabric exists, neighboring tools).
 
 Twill is a typed directory of fabric objects that agent runtimes **resolve**
 into capabilities they can use. Five object kinds exist; only `Workspace` is
-built in v1. This document specifies the **invariants every kind and every
-consumer shares** — the envelope, the identity rules, the route vocabulary,
-and the resolution algorithm — so that kind-specific specs stay small and so
-that adapters for one kind need know nothing about another kind.
+built in v1alpha1. This document specifies the **invariants every kind and
+every consumer shares** — the envelope, the identity rules, matching, the
+resolution algorithm — so that kind-specific specs stay small and so that
+adapters for one kind need know nothing about another kind.
 
 The single question this protocol answers:
 
-> Given a **name** and a **consumer**, how does the consumer get a usable
-> capability, and how is it prevented from silently colliding with another
-> consumer of the same physical resource?
+> Given a **kind**, a **name**, and a **consumer**, how does the consumer get
+> a usable capability, and how is it prevented from silently colliding with
+> another consumer of the same physical resource?
 
-## 2. Objects and the common envelope
+## 2. The envelope
 
 Every fabric object is one YAML document in the following CRD-forward shape.
-This shape is **fixed by the protocol**, not by kinds:
+The envelope is protocol-fixed; kinds may not alter it:
 
 ```yaml
 apiVersion: twill.bitwiseoperations.ca/v1alpha1     # required; version rules in §7
 kind: Workspace | Card | MCPServer | Skill | AgentProfile
 metadata:
-  name: <string>                # registry-unique within (kind)
-  labels: {<class keys>}        # optional; kind-defined
+  name: <string>          # unique within this kind
+  labels: {<class keys>}  # optional
 spec:
-  storage: { id: <string>, fingerprint: <string, optional> }   # see §3
-  owner: <subject>              # REQUIRED — §4
-  routes: [<route object>]      # ordered, may be empty — §5
-  profile: { ... }              # kind-defined; opaque to protocol
-status: {}                      # reserved; controller-owned in v2, reader-ignored
+  owner: <subject>        # REQUIRED — §4
+  routes: [<route>]       # ordered, may be empty — §5
+  <kindname>: { ... }     # the kind's spec object; name = lowercase kind — §2.2
+status: {}                # reserved; controller-owned in v2, reader-ignored
 ```
 
 Protocol rules on the envelope:
 
-- `kind` is one of the five values above. No others may be defined without a
-  protocol version bump (§7).
-- `metadata.name` is unique within a `kind`; there is no cross-kind
-  uniqueness requirement.
-- `spec` carries at least the fields above; kinds add their own under
-  clearly-namespaced subkeys (`profile` is the designated home) and **must
-  not** put kind fields at `spec.` top level (keeps the common shape stable).
+- **`spec.` top level carries exactly four keys:** `owner`, `routes`,
+  `<kindname>`, and nothing else. All kind-specific data lives under
+  `spec.<kindname>`. This is the mechanically-decidable line between protocol
+  fields (which require a version bump to add) and kind fields (which don't).
+- `apiVersion` is protocol-owned; version rules in §7.1.
+- `kind` is one of the five values above; adding kinds is a protocol version
+  bump (§7.2).
+- `metadata.name` is unique within a kind; there is no cross-kind uniqueness.
 - `status` is structurally reserved: readers must treat it as opaque, writers
-  (v1: humans) must leave it empty. v1 readers must not require it to exist.
-- A document may be *inert*: well-formed but with no behavior yet. Inert
-  documents are valid input to the protocol; discovery lists them (§6.3).
+  in v1alpha1 must leave it empty. Readers must not require it to exist. (The
+  composite's "absent in v1" phrasing means the same rule, restated; this
+  wording is the operative one.)
+- A document may be **inert**: well-formed but with no resolvable behavior
+  yet (`§7.3`). Inert documents are valid fabric input.
 
-## 3. Identity and the one correctness invariant
+### 2.1 The kind spec object (`spec.<kindname>`)
 
-`spec.storage.id` is the object's **durable identity**. It is:
+The lowercase kind name is the name of the kind's spec object: a Workspace
+document has `spec.workspace`, a Card has `spec.card`, an MCPServer has
+`spec.mcpserver`, a Skill has `spec.skill`, an AgentProfile has
+`spec.agentprofile`. The kind spec owns everything under it: its own durable
+id (§3), its route-type vocabulary (§5.2), its route-envelope elaborations,
+its matching-relevant semantics, its own fields.
 
-- Minted once when the object is created, never recycled.
-- **Immutable under rename.** Renaming `metadata.name` must not change
-  `spec.storage.id`.
-- Carried through every route, adapter, and capability derived from the
-  object. A capability minted from an object must stamp the object's
-  `spec.storage.id` into the capability's identity.
-- The *only* mechanism by which two consumers are guaranteed to serialize
-  correctly when their capabilities point at the same physical resource.
+This rule is what lets new kinds land without touching the protocol: the
+protocol knows where to find `spec.<kindname>`; it does not know or care
+what's inside.
 
-Why this field exists: the ecosystem's workspace runtimes serialize file
-writes by **environment id + path**. Any two consumers that resolve to the
-same physical bytes must mint capabilities with the **same** `storage.id` —
-this is the write-serialization invariant. Runtimes without the concept
-inherit it by adopting `spec.storage.id` as their capability id when talking
-to twill-resolved resources.
+### 2.2 Durable id (per kind)
 
-`spec.storage.fingerprint` is an optional out-of-band verifier (volume UUID,
-machine-id, content hash). The protocol treats it as advisory in v1; it is the
-v2 hook for controller-verified identity and is **not** load-bearing yet.
+Every kind MUST designate a **durable id field** at a protocol-fixed path
+under `spec.<kindname>`:
+
+- **Storage-backed kinds** (§3): `spec.<kindname>.storage.id`
+  (e.g. a Workspace's `spec.workspace.storage.id`)
+- **All other kinds**: `spec.<kindname>.id`
+  (e.g. a Skill's `spec.skill.id`, an AgentProfile's `spec.agentprofile.id`)
+
+The durable id is minted once at object creation, immutable under rename,
+and never recycled. The protocol requires its existence and immutability;
+the kind spec assigns the value and states what the id identifies. Identity
+is a cross-kind protocol requirement even though the *write serialization*
+refinement (§3) applies only to storage-backed kinds: a Skill has a
+`skill.id` identifying the skill even though no two consumers can corrupt
+each other through it.
+
+## 3. Storage-backed kinds and the write-serialization invariant
+
+For **storage-backed kinds** (Workspace only, in v1alpha1), the durable id
+is `spec.<kindname>.storage.id` and has an additional meaning beyond identity:
+
+> **`storage.id` is the identifier a consumer uses to serialize writes
+> against the physical resource the object resolves to.**
+
+Rules specific to storage-backed kinds:
+
+- **Physical-resource semantics.** If two objects' routes can ever resolve to
+  the same physical bytes, those objects **MUST declare the same
+  `storage.id`**. Minting a fresh id per object when two objects alias one
+  backing store defeats write serialization — this is the correctness bug
+  the field exists to prevent.
+- **Author-assigned, not protocol-generated.** The author of the registry
+  document is responsible for assigning `storage.id` correctly; two documents
+  over one volume share the value by authorial intent, not by any automated
+  dedupe.
+- **Adapter responsibility.** A capability minted from a storage-backed
+  object MUST carry that object's `storage.id` in a protocol-reserved
+  identity slot (`cap.identity`). The **adapter** is the responsible actor;
+  runtimes without a native id concept inherit the value verbatim (runtimes
+  that never run a resolver get the id from the adapter's generated config).
+- **Immutability under rename.** Renaming `metadata.name` must not change
+  `storage.id`.
+- `spec.<kindname>.storage.fingerprint` (optional) is an out-of-band
+  verifier (volume UUID, machine-id, content hash); advisory in v1alpha1,
+  the v2 hook for controller-verified identity.
+
+Non-storage-backed kinds (Card, MCPServer, Skill, AgentProfile in v1alpha1)
+have no aliasing hazard: two Skill documents naming the same skill are
+duplicates, not a serialization conflict. Their durable ids are identifiers,
+not correct-serialization guards.
 
 ## 4. Owner and principal
 
-Every object has **one** `spec.owner`, a subject string. Required even for
-single-user deployments — it is the day-one access-control hook and its
-absence in v1 would force a migration later. v1 consumers may ignore it for
-*access decisions* (v1 auth is deployment-shaped, not schema-shaped), but
-must preserve it in documents they create or mutate.
+Every object has **one** `spec.owner`, a subject string in the grammar
+`<scheme>:<id>` (e.g. `user:example`, `team:platform`). Required even
+for single-user deployments — day-one access-control hook; omitting it in
+v1alpha1 forces a migration later. v1alpha1 consumers may ignore it for
+access decisions but must preserve it in documents they create or mutate.
 
-A **principal** is the authenticated subject of a resolution request.
-`spec.owner` is the registry-side claim; principal is the request-side claim.
-The protocol keeps them separate so a v2 controller can bind them.
+A **principal** is the request-side claim of identity. `spec.owner` is the
+registry-side claim. The protocol keeps them separate so a v2 controller can
+bind them. **Routes are not an authorization boundary**: `principal` is
+self-declared in v1alpha1 and must be treated as untrusted; matching on
+`principal` selects configuration but does not enforce access.
 
 ## 5. Routes
 
-A route is an object inside `spec.routes[]`. Routes are **per-consumer
+A route is one object inside `spec.routes[]`. Routes are **per-consumer
 resolvers**: the same object yields different capabilities to different
-consumers, and the route set is how that is declared.
+consumers.
 
-### 5.1 Route shape (protocol-fixed)
+### 5.1 Route envelope (protocol-fixed)
 
 ```yaml
-- match: {agentLocation: <string>, agentKind: <string>, principal: <string>}   # any subset; omitted = matches all
-  type: local | ssh | k8s-exec | agent        # §5.2
-  # type-specific fields follow (address, path, address, ...; kind specs define them)
-  precondition: { type: <kind-defined>, ... } # optional — §5.3
+- match: {agentLocation: <string>, agentKind: <string>, principal: <string>}   # any subset; omitted = match all
+  type: <string>                          # route type; kind-defined enum — §5.2
+  precondition: { steps: [ ... ] }        # optional, ordered — §5.3
+  # (kind-defined route fields follow, under the same route object)
 ```
 
-Protocol enforces only the envelope of a route: the presence of `match` (a
-consumer selector), `type`, optional `precondition`. Everything inside a
-route besides `match`/`type`/`precondition` is **kind-defined** and opaque
-to core.
+The protocol fixes only the envelope keys: `match`, `type`, `precondition`.
+Every other key on a route object is kind-defined. `match` is optional;
+`match: {}` and absent `match` both mean "matches every consumer." Unknown
+keys inside `match` are a spec violation (matching keys are closed by §5.1).
 
-Ordering is meaningful: **first route whose `match` fits the consumer and
-whose target is reachable wins.** `match` uses subset semantics — a route
-matches if every key it specifies equals the consumer's corresponding field.
-Unspecified fields match anything.
+### 5.2 Route `type` value
 
-### 5.2 Route types (protocol-fixed vocabulary)
+The `type` value is a string. **The set of valid route types is owned by the
+kind spec, not by the protocol.** The protocol does not enumerate
+`local`/`ssh`/`k8s-exec`/`agent` — those are the Workspace kind's types.
+Kinds may define whatever route types are meaningful for their abstraction
+(an MCPServer kind's types will likely differ from a Workspace's), and
+onboarding a new kind never requires a protocol version bump because its
+vocabulary is unfamiliar.
 
-`type` is one of four values. The list is protocol-fixed; adding a type is a
-protocol version bump. The *semantics of each type* are kind-defined — this
-spec only names them so that all kinds share the vocabulary.
+A convention, not a rule: kinds whose routes concern the same physical
+mechanisms SHOULD reuse the same route-type names (a future kind with a
+filesystem route should call it `local`, not `direct`), so the fabric reads
+coherently across kinds.
 
-| `type` | Protocol meaning | Kind-defined details |
-|---|---|---|
-| `local` | Capability resolves through the consumer's own filesystem/shell | path, resolve steps |
-| `ssh` | Capability resolves over SSH (exec/sftp) to a target host | address, path |
-| `k8s-exec` | Capability resolves by exec into a k8s pod/PVC | pod/pvc, path |
-| `agent` | Capability is delegated to a remote executor, lease-bounded — see §7 of the rationale doc (`2026-10-02`, §7.1) and the workspace kind spec | lease terms, executor selector |
+### 5.3 `precondition.steps[]`
 
-`agent` is protocol-reserved today (no kind may define elaborations of it in
-v1alpha1), present in the vocabulary **only** so that future delegation work
-doesn't require a schema bump. AWCP (arXiv 2602.20493) is the reference
-model when it lands.
+A route may declare `precondition`: an **ordered list** of provisioning steps
+the resolver runs *before* attaching the capability. Each step is an object
+with a kind-defined `type` and kind-defined fields. Steps execute in order;
+**any step's failure makes the route unusable** (the resolver moves to the
+next route; `§6`). Preconditions MUST be idempotent — re-resolving an
+already-resolved route must not re-do provisioning destructively.
 
-### 5.3 `precondition`
+Typical step `type` vocabulary (`gitClone`, `worktree`, `pvcBind`,
+`remoteMkdir`, `mountCheck`) is owned by the Workspace kind spec.
 
-A route may declare a `precondition`: an ordered, idempotent provisioning
-step the resolver runs **before** attaching the capability. The protocol
-fixes only the existence and ordering of preconditions: `precondition` is a
-single object with a kind-defined `type`; multiple provisioning steps are
-expressed by kind spec as nested/ordered structure, not as a list at the
-route envelope (so kind specs own that shape). Preconditions must be
-**idempotent** — re-resolving a route that was already resolved must not
-re-do provisioning destructively.
+## 6. Resolution and matching
 
-Typical precondition *types* (`gitClone`, `worktree`, `pvcBind`,
-`remoteMkdir`, `mountCheck`) are kind-vocabulary, not protocol vocabulary;
-they live in the workspace kind spec.
-
-## 6. Resolution
-
-Resolution is the only operation the protocol specifies. It maps
-`(objectName, consumer)` to either an **attached capability** or an
-explicit unreachable result. Implementations conform to this algorithm;
+Resolution maps `(kind, objectName, consumer)` to exactly one of three
+results: an **attached capability**, `NoMatch`, or `Unreachable`.
+Implementations MUST conform to this algorithm:
 
 ```
-resolve(objectName, consumer) -> Result<capability, Unreachable>:
-  obj    <- registry.get(kind, objectName)         # any backend: file, api, ...
-  routes <- obj.spec.routes.filter(matches(match, consumer))    # subset match, §5.1
+resolve(kind, objectName, consumer) -> Attached | NoMatch | Unreachable:
+  obj    <- registry.get(kind, objectName)
+  routes <- obj.spec.routes.filter(matches(r.match, consumer))   # §6.1
+  if routes is empty: return NoMatch(obj, consumer)
+  errors <- []
   for r in routes (in declared order):
-    if not reachable(r): continue                  # per-kind reachability probe
-    if r.precondition exists: run it               # idempotent, §5.3
-    cap  <- kind.attach(r)                          # kind-defined semantic
-    cap.identity <- obj.spec.storage.id             # force per §3
-    return cap
-  return Unreachable(routes, lastError)
+    if not reachable(r):                                    # kind-defined probe
+      errors.append((r, "unreachable")); continue
+    for step in (r.precondition?.steps ?? []):              # §5.3
+      if step fails:
+        errors.append((r, "precondition failed")); continue outer
+    cap  <- kind.attach(r)                                  # kind-defined
+    cap.identity <- obj's write-serialization identity      # forced, §3:
+                 #   storage.id for storage-backed kinds;
+                 #   the durable id otherwise
+    return Attached(cap)
+  return Unreachable(obj, consumer, errors)
 ```
 
 Rules:
 
-- `consumer = { agentLocation, agentKind, principal }`. All three may be
-  empty; empty matches only routes whose `match` imposes nothing (or whose
-  specified fields are all empty in practice — not recommended; see kind
-  spec for matching nuances).
-- **Order-before-reachability.** Routes are tried in declared order; a
-  reachable route lower in the list is used only if all earlier matching
-  routes are unreachable. `match`-misses are skipped, not failures.
-- **Idempotence at every step.** Re-resolution from the same consumer must
-  give a capability equivalent to the first result.
-- **No capability may outlive its lease** if the route grants one (matters
-  only for future `agent` type).
-- **Force `storage.id`.** This is the single mandatory postcondition,
-  overriding any id the kind's attach step would naturally mint.
+- **Three distinct results.** `NoMatch` = no route's `match` selected this
+  consumer (configuration intent, not failure). `Unreachable` = at least one
+  route matched but none survived reachability/precondition. UIs and agents
+  must be able to tell these apart: NoMatch is "nothing is for you,"
+  Unreachable is "something is for you and it's not working."
+- **Per-route errors in `Unreachable`.** The result carries
+  `(route, reason)` pairs in attempted order, so callers can tell whether the
+  whole set failed or only higher-priority routes did.
+- **Order before reachability.** A reachable route lower in the list is used
+  only if every earlier matching route was genuinely unusable (unreachable,
+  failed precondition). Matching is not a health check.
+- **Identity postcondition.** Whatever `kind.attach` would naturally mint as
+  the capability's identity, the forced assignment above wins. This is the
+  mechanism D1/D3 make enforceable.
+- **Resolver portability.** The *registry service* is authoritative for
+  remote consumers; a runtime may implement a local resolver for offline
+  operation. Multiple resolvers against the same registry documents and the
+  same consumer declaration MUST produce the same route selection and the
+  same capability identity. Live capability state (ssh connections, FUSE
+  mounts) will obviously differ and is not part of the conformance rule.
+- Per-consumer resolution is a feature: two consumers of the same object
+  SHOULD expect different capabilities.
 
-Where resolution is implemented: the *registry service* (`docs/…workspace/spec
-T1`) is authoritative for remote consumers; runtimes may implement an
-equivalent resolver locally for offline operation, but must produce
-byte-identical outputs given the same registry and the same consumer
-declaration. Per-consumer resolution is a feature, not an optimization —
-two consumers of the same object *should* get different capabilities.
+### 6.1 Matching semantics
+
+Matching between a route's `match` and a consumer is **exact string equality
+on every key `match` specifies**; the consumer's declaration supplies
+`agentLocation`, `agentKind`, `principal` (each a string, each required on
+the consumer, each possibly empty). A route matches iff every key it lists
+equals the consumer's value for that key; absent keys match anything. No
+wildcards, no case folding, no regexes, no version-suffix rules.
+
+**Guidance (non-normative):** versioned `agentKind` values in routes
+(`pi/0.99.1`) are a footgun — any version bump un-matches existing routes.
+Match on the runtime family (`pi`, `hermes`) unless a route genuinely needs
+to discriminate by version, and document the version grammar in the kind
+spec if it does.
 
 ## 7. Versioning and discovery
 
 ### 7.1 Version policy
 
-`apiVersion` is a protocol contract. `v1alpha1` allows **adding kinds' spec
-fields** and **refining kind-defined semantics**, but does not allow:
-removing or renaming protocol fields (envelope, `storage.id`, `owner`,
-`match`, `type`, `precondition`); adding route types; changing ordering/
-matching semantics; or making `status` meaningful to readers.
+`apiVersion: twill.bitwiseoperations.ca/v1alpha1` permits, without a markdown bump:
+adding fields inside `spec.<kindname>`; adding or refining kind-defined
+route types; refining kind-specific matching-relevant semantics where the
+protocol leaves them open. v1alpha1 does **not** permit:
+adding/removing/renaming any of the four `spec.`-top-level keys; adding
+consumer dimensions to the match selector; changing matching semantics;
+renaming the durable-id path rule; making `status` meaningful to readers.
 
-A protocol change that breaks any of these = new `apiVersion`. Kind specs
-define their own compat within these guards.
+Any such change is a new `apiVersion`. (This makes the kind/protocol
+boundary mechanically decidable: if a field is not one of the four
+envelope keys and sits under `spec.<kindname>`, it is kind-owned.)
 
 ### 7.2 Enum policy (kinds)
 
-The five kinds are protocol-fixed. Adding a new kind requires a protocol
-version bump; this is deliberately heavy so that namespace sprawl requires
-an explicit decision.
+The five v1alpha1 kinds are protocol-fixed. Adding a new kind is a protocol
+version bump — deliberately heavy so namespace sprawl requires an explicit
+decision. (Kind-defined route types and kind spec fields do not trigger
+this.)
 
 ### 7.3 Discovery
 
-Consumers learn what the fabric knows about from:
-`GET /twill/v1alpha1` → list of objects, **including inert ones**,
-with their kinds. Presence in the discovery set does not imply live
-behavior — inert objects are listed with a discovered-from flag so
-consumers can distinguish "the registry has this" from "the registry can
-resolve this."
+Discovery is the capability to list what a registry knows about. The
+protocol fixes the *abstract shape*: a **list of object references**, where
+each entry is:
 
-## 8. Persistence is out of scope (deliberately)
+```
+{ kind: <string>, name: <string>, durable_id: <string|null>, resolvable: bool }
+```
 
-This protocol does not specify storage. The registry's YAML documents are
-the source of truth; whether they live in a ConfigMap, a file, or a CRD is
-an implementation decision of the registry service (workspace kind spec,
-deployment section). The protocol only requires the *shape* of a document
-and the *resolution behavior* on it.
+Rules:
+- `resolvable` is a **per-object, registry-side** boolean (not per-consumer):
+  `true` iff the object's kind has a registered kind-runner in the serving
+  process AND `spec.routes` is non-empty. Cards in a registry with no card
+  service are inert, so they appear with `resolvable: false` — exactly the
+  "list them, don't pretend to resolve them" rule from the Card holding note.
+- Discovery lists **every object the registry holds, inert included**.
+- The concrete transport for discovery (HTTP, file walk, CLI output) is
+  **not** core-protocol business; that shape belongs to the registry-service
+  spec (in the workspace kind spec, deployment section). This document fixes
+  only the abstract list-of-references shape.
+
+## 8. Persistence and transport are out of scope (deliberately)
+
+This protocol does not specify how documents are stored or served. The
+registry's YAML documents are the source of truth; whether they live in a
+ConfigMap, a file tree, or a CRD is the registry service's implementation
+decision (workspace kind spec). The protocol only requires the *shape* of a
+document, the *resolution behavior*, and the *discovery shape* above.
 
 ## 9. Non-goals (restated in protocol terms)
 
-- Not a workflow engine: no state machines here, no transitions, no leases
-  except what route-types carry.
-- Not a secret manager: routes reference credential profiles, credentials
-  live in consumer-local config or the cluster's sealed secrets.
-- Not an agent runtime: capabilities are returned to the caller who uses
-  them; the caller's loop is not twill's business.
-- Not a delegation protocol: `agent` route is reserved vocabulary; the AWCP
-  design inputs live in the workspace kind spec (§7.1 of the rationale doc).
+- Not a workflow engine: no state machines here, no transitions.
+- Not a secret manager: route credential references are pointers; bytes live
+  in consumer-local config or sealed secrets.
+- Not an agent runtime: capabilities are returned to the caller, whose loop
+  is its own business.
+- Not a delegation protocol: `agent` route types (when a kind spec defines
+  one) are elaborations of that kind, not core vocabulary. The AWCP design
+  inputs (arXiv 2602.20493) live in the workspace kind spec's §7.1.
 
 ## Appendix A. Terms
 
 - **Capability** — the kind-specific thing a consumer gets on successful
-  resolve (for Workspace: an `ExecutionEnv`-shaped fs+shell; other kinds
-  define their own).
+  resolve (for a Workspace, an ExecutionEnv-shaped fs+shell).
 - **Consumer** — the tuple `{ agentLocation, agentKind, principal }` making a
-  resolve request.
-- **Delegate / Executor** — for future `agent` routes: the remote agent the
-  workspace is leased to (AWCP vocabulary).
-- **Inert object** — a well-formed registry document with no current
-  behavior; listed in discovery, not resolvable.
-- **Reachability** — kind-defined criterion for whether a route's target is
-  usable *now*; protocol requires only that it's checked before attach.
+  resolve request; self-declared, untrusted in v1alpha1.
+- **Durable id** — each kind's `<kindname>.id` under `spec.<kindname>`;
+  existence+immutability required by protocol, semantics kind-defined.
+- **Inert object** — a well-formed document with no resolvable behavior
+  (`resolvable: false` in discovery).
+- **Reachability** — kind-defined probe whether a route's target is usable
+  now; protocol requires only that it gates attach.
+- **Storage-backed kind** — a kind whose durable id is
+  `spec.<kindname>.storage.id` and carries the write-serialization invariant
+  of §3 (v1alpha1: Workspace only).

@@ -17,26 +17,32 @@ The fabric must not be held hostage to its weakest kind.
 
 ## 1. What Card is pinned to look like (schema, not behavior)
 
-The fields below are part of the *common shape* promise in
-`twill-fabric-core` — every kind follows `spec + routes[]`. Card's `spec` is
-the set of fields adapters may safely assume exist when they encounter a Card
-document. Anything not listed here is undefined and may change.
+The fields below conform to the fabric-core envelope (`spec.<kindname>`
+for kind data, `routes` and `owner` at top level). Card is **not
+storage-backed** in v1alpha1 (its persistent store is the card service's own,
+not bytes an agent serializes against), so its durable id is
+`spec.card.id`. The pinned `spec.card` fields are what adapters may safely
+assume exist when they encounter a Card document. Anything not listed here
+is undefined and may change.
 
 ```yaml
 apiVersion: twill.bitwiseoperations.ca/v1alpha1
 kind: Card
 metadata: { name: <string>, labels: {} }
 spec:
-  title: <string>
-  state: idea | specced | ready | claimed | executing | review | done | blocked
-  workspace_ref: <workspace name, optional>
-  repo_refs: [<repo identifiers>]       # multi-repo by design
-  spec_ref: <link to a spec/PR/issue>
   owner: <subject>
-  claimed_by: <session/run id | "">
-  claim_token: <random | "">
-  parent_card: <card name | "">
-  labels: [<strings>]
+  routes: []          # likely unused for cards in v1alpha1; pinned for envelope
+  card:
+    id: cd_...        # durable id (Card's identity; no write serialization)
+    title: <string>
+    state: idea | specced | ready | claimed | executing | review | done | blocked
+    workspace_ref: <workspace name, optional>
+    repo_refs: [<repo identifiers>]     # multi-repo by design
+    spec_ref: <link to a spec/PR/issue>
+    claimed_by: <session/run id | "">
+    claim_token: <random | "">
+    parent_card: <card name | "">
+    labels: [<strings>]
 status: {}      # reserved, controller-owned in v2
 ```
 
@@ -64,7 +70,8 @@ re-litigate them:
 - **Cards as future dispatch handles.** A claimed Card + an AgentProfile
   workspace + a runner model is the spawn point for AgentProfile dispatch.
   Card state names were chosen so this composition is low-diff later.
-- **`owner` non-optional**, same as every kind (ACL-from-day-one invariant).
+- **`owner` non-optional**, non-storage-backed durable id (`spec.card.id`),
+  kind data under `spec.card` — conformant to the fabric-core envelope.
 
 ## 3. What is deliberately *not* pinned
 
@@ -97,11 +104,13 @@ survey; the Card spec session must consciously respond to each:
 
 ## 5. Interaction with the fabric layer today
 
-- `GET /twill/v1alpha1` (discovery) **must** list `Card` among known kinds in
-  `v1alpha1` even though no Card service runs — registry documents of kind
-  Card are valid, just unowned/unresolved.
-- Card documents in registry YAML are **inert** in v1: no resolve behavior, no
-  precondition behavior, no status writes.
+- `GET /twill/v1alpha1` (discovery) **must** list Card documents in
+  `v1alpha1` with `resolvable: false` even though no Card service runs —
+  registry documents of kind Card are valid, just inert. The abstract
+  discovery list shape is `{ kind, name, durable_id, resolvable }` (fabric-core
+  §7.3); concrete transport is the registry service's business.
+- Card documents in registry YAML are **inert** in v1: no resolve behavior,
+  no precondition behavior, no status writes.
 - The Card kind does not exempt any agent adapter from implementing Workspace
   first; Cards are not part of serialize-by-`storage.id` correctness (only
   Workspaces route to backing storage).

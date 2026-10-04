@@ -130,7 +130,7 @@ fabric object = spec (what it is, CRD-shaped) + routes[] (how YOU reach it)
 | Kind | Resolves to | v1 |
 |---|---|---|
 | `Workspace` | an fs+shell capability for the consumer's location | yes |
-| `Card` (skuld) | a work item with repo refs, spec link, claim state | yes |
+| `Card` (skuld) | a work item with repo refs, spec link, claim state | schema-pinned, deferred |
 | `MCPServer` | endpoint + credential profile per location | reserved |
 | `Skill` | versioned instruction bundles, registry-served | reserved |
 | `AgentProfile` | runtime + model + host + workspace for dispatch | reserved |
