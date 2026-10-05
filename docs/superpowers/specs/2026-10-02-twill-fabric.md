@@ -234,8 +234,9 @@ Do not implement Card from this document.
   watched). In-cluster Deployment + PVC, single replica.
 - **Exposes (concrete HTTP surface is in the workspace kind spec):**
   `GET /twill/v1alpha1` (discovery), `GET /twill/v1alpha1/<kind>/<name>`,
-  `POST /twill/v1alpha1/resolve`, `POST /<kind>/<name>/claims`,
-  `GET /claims?parent=<name>` (provider read-path), provider `statusReport`
+  `POST /twill/v1alpha1/resolve`, `POST/PATCH /twill/v1alpha1/Claim/<name>`,
+  `GET /twill/v1alpha1/claims?parent=<kind>/<name>` (provider read-path),
+  provider `statusReport`
   push, `GET /twill/v1alpha1/health`, and `PATCH`.
 - **Auth:** v1 deployment-shaped (Tailnet-only LoadBalancer Service, or a
   token header); `principal` self-declared.

@@ -1,6 +1,6 @@
 # Twill fabric core — the protocol
 
-**Status:** Draft (revision 6 — parties + status surface + Claim-first-class)
+**Status:** Draft (revision 7 — §8.3 lineage rule + claim transport closure)
 **Date:** 2026-10-04
 **Scope:** The **agent-agnostic workspace fabric protocol only**. Weakest-link
 doc: every kind spec inherits and may not restate or redefine it. This doc is
@@ -95,8 +95,8 @@ never recycled. What the id identifies is kind-defined.
 incorporate the parent's (e.g. `ws_01J8Z4-feat-x` is a child of
 `ws_01J8Z4-...`) and MUST differ (children are views, not aliases). A
 child's `storage.fingerprint` MUST equal the parent's (same physical
-volume). Whether parents and children share `fingerprint` (yes) while
-differing in `storage.id` is the load-reject exemption case (§8.3).
+volume). Whether documents sharing a `fingerprint` are load-accepted or
+rejected is governed by the lineage rule (§8.3).
 
 Non-storage-backed kinds derive child ids by the same convention for
 navigability; strictness is kind-owned.
@@ -165,8 +165,8 @@ resolve(kind, name, consumer) -> Attached | NoMatch | Unreachable:
   health check.
 - **Selectability, not reachability**: the registry consults the status
   surface (§8); what "selectable" means is kind-mapped. Selectability is
-  `st.selectable := st.ready OR st.provisionable` (degraded implies
-  selectable via `ready: true`; cold implies selectable via
+  `st.selectable := st.ready OR st.provisionable` (a `ready` workspace
+  selects via `ready: true`; a cold workspace selects via
   `provisionable: true`).
 - **Static route data**: returned `route` is a verbatim copy from the
   stored document (no injected fields, no per-attach dynamic data).
@@ -214,13 +214,14 @@ The adapter turns this into a capability and stamps
 
 ## 8. Status surface: providers report; registry forwards
 
-Protocol-owned shape — six fields, closed:
+Protocol-owned shape — six fields (closed to removal/rename; additive
+per §10.1):
 
 | Field | Type | Meaning |
 |---|---|---|
 | `ready` | bool | "a consumer may attach now" (kind-mapped from the provider's lifecycle) |
 | `provisionable` | bool | "the provider can lazily materialize on demand" (kind-mapped) |
-| `claimedBy` | `[consumers]` | who currently holds claims (derived from Claim documents — see §9) |
+| `claimedBy` | `[claims]` | who currently holds claims (derived from Claim documents — see §9); each element is `{name, owner, claimedOn}` — the Claim's metadata.name, its `spec.owner`, and its `spec.claim.claimedOn` |
 | `progress` | string | kind-owned free-form text for humans; advisory, never parsed |
 | `asOf` | rfc3339 | the provider-reported observation time |
 | `source` | `live` \| `cached` | registry-set: which side of the cache this observation came from |
@@ -244,6 +245,34 @@ so provider hang does not vanish existing claims.
 
 The cache has a TTL, kind-spec-tunable (v1alpha1: 60s).
 
+## 8.3 Load-time and reload-time reject (the lineage rule)
+
+The registry MUST reject the document set on (re)load when two documents
+conflict on identity, where conflict is computed as:
+
+- **Fingerprint collision without lineage**: two documents share a
+  populated `storage.fingerprint` and have different `storage.id`s, AND
+  the two are **not** in a common lineage — i.e. neither is a
+  `spec.parent`-chain ancestor of the other, and they do not share a
+  common ancestor carrying that fingerprint. Lineage is computable from
+  the document set (follow `spec.parent` chains; two documents are in a
+  common lineage iff their ancestor sets intersect). Parent/child pairs
+  and siblings under one root are the declared-alias case and load
+  cleanly; two *unrelated* roots claiming one physical volume are the
+  corruption case and are rejected.
+- **Duplicate durable id**: two documents carry the same durable id
+  (`storage.id` or `<kindname>.id`) — always rejected regardless of
+  fingerprint or lineage.
+
+On rejection the registry serves the **last-good document set** (no hard
+exit; single-replica availability prevails), reports its degraded surface
+(`GET /twill/v1alpha1/health` → `{"documentSet": "stale", "rejectedAt":
+<rfc3339>, "reason": ...}`; on a valid set it returns
+`{"documentSet": "current"}`), and logs the rejection. Cold start with a
+rejected set: serve the **empty** registry, `documentSet: stale`, log the
+rejection. Kind specs decide what "the document set" means (watched
+ConfigMap, bind-mount, or both).
+
 ## 8.4 Claims occupy the storage, not the route
 
 A claim's occupancy identity is `claimedOn: {fingerprint, durable_id}` —
@@ -253,7 +282,9 @@ fingerprint is the level exclusivity operates at: two Workspaces with
 the same fingerprint see each other's claims regardless of which route
 either consumer resolved through. `claimedOn` is what makes RWO
 exclusive across views (including parent+child views of the same pool).
-Non-storage-backed kinds use the durable id.
+**Non-storage-backed kinds use the durable id and leave `fingerprint`
+absent/empty** (there is no physical volume to occupy; exclusivity on
+e.g. a Card is per-object by definition).
 
 ## 9. Claims are first-class children
 
@@ -271,32 +302,42 @@ spec:
   claim:
     storageBacked: false
     id: cl_...
+    route: { type: ssh, address: "..." }      # the resolved route this claim binds
+                                              # (which provider is on the hook)
     parameters:
       branch: feat-x
       worktreeName: feat-x                    # parameters the provider
                                               # materializes from
-    claimedOn: {fingerprint: vol-2c4f1a, durable_id: "ws_01J8Z4-feat-x"}
-  parent: { kind: Workspace, name: payments-repo-feat-x }
+    claimedOn: {fingerprint: vol-2c4f1a, durable_id: "ws_01J8Z4"}
+    released: false                           # set true to release (PATCH)
+  parent: { kind: Workspace, name: payments-repo }
 status: {}
 ```
 
 Rules:
 
-- Claims are first-class children, `spec.parent` is the claimed resource.
-- `spec.claim.parameters` is kind-defined for the claimed kind (Workspace's
-  parameters are things like `branch`, `worktreeName`; k8s-exec parents
-  accept PVC-ish parameters; other kinds define theirs).
-- `claimedOn` carries fingerprint + durable_id (§8.4).
-- Claims are **document-derived**: the registry derives `claimedBy` from
-  all un-released Claim documents of a given `claimedOn` fingerprint —
-  the provider's statusReport updates `ready`/`provisionable`/`progress`/
-  `asOf` but never overwrites `claimedBy`.
-- **Release**: consumers release by deleting their Claim document (or
-  marking its `.spec.claim.released: true` in v1alpha1 without a delete
-  endpoint). The registry's next status surface computation removes it
-  from `claimedBy`.
-- Claims that reference missing parents, missing releases, or parameters
-  conflicting with already-loaded children are loader-rejected.
+- Claims are first-class children; `spec.parent` is the **existing,
+  registered** resource being claimed (the repo workspace, the pool
+  root). Claims never name a not-yet-materialized child as parent —
+  the child's identity (`branch`, `worktreeName`, ...) is carried in
+  `spec.claim.parameters`, and the **provider authors the child document**
+  once materialization succeeds (via the registry's document surface).
+  Claims referencing missing parents are loader-rejected, with no lazy-
+  materialization exemption — the parent must exist.
+- `spec.claim.route` records which resolved route (and therefore which
+  provider handle) the claim binds; the provider claims read-path filters
+  on it, so two providers backing one fingerprint never both materialize.
+- `spec.claim.parameters` is kind-defined for the claimed kind
+  (Workspace's parameters are things like `branch`, `worktreeName`).
+- `claimedOn` carries fingerprint + durable_id (§8.4); fingerprint is
+  absent for non-storage-backed kinds.
+- Claims are **document-derived**: the registry derives `claimedBy`
+  (elements `{name, owner, claimedOn}`) from all un-released Claim
+  documents of a given `claimedOn` — the provider's statusReport updates
+  `ready`/`provisionable`/`progress`/`asOf` but never carries `claimedBy`.
+- **Release**: consumers release via `PATCH` on their Claim document
+  setting `spec.claim.released: true`. The registry's next status
+  surface computation removes it from `claimedBy`.
 - **v1alpha1 claims are advisory**: there is no enforcement that a second
   consumer may not proceed against a `claimedOn` owned by another claim;
   adapters SHOULD warn; RWO lease mechanics are v2. Claims are the
@@ -325,9 +366,11 @@ readers MUST ignore unknown status fields); new claims of existing kinds.
 v1alpha1 does **not** permit: removing or renaming any of the four
 envelope keys; changing the shape of `match`; changing the match selector
 dimensions; changing the durable-id rule; changing the `precondition`
-envelope; changing the Attached descriptor's closed top-level keys;
+envelope; removing or renaming Attached descriptor top-level keys;
 subtracting status fields; changing `claimedOn` shape. Any such change
-is a new `apiVersion`.
+is a new `apiVersion`. (Protocol surfaces are **closed to
+removal/rename, additive-only**: new fields may be added anywhere
+readers are told to tolerate them.)
 
 v1alpha1 is pre-release: payload shapes may tighten between iterations;
 readers MUST tolerate unknown fields.

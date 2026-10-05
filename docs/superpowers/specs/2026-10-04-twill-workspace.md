@@ -1,8 +1,8 @@
 # Twill — Workspace kind spec
 
-**Status:** Draft (revision 5 — Claim-first-class, lifecycle mapping)
+**Status:** Draft (revision 6 — claim transport + child authoring path)
 **Date:** 2026-10-04
-**Inherits:** `2026-10-04-twill-fabric-core.md` (revision 6, authoritative).
+**Inherits:** `2026-10-04-twill-fabric-core.md` (revision 7, authoritative).
 This document instantiates; it does not restate or redefine core.
 **Scope:** the `Workspace` kind — schema, lifecycle mapping, route types,
 preconditions, adapters, deployment.
@@ -97,9 +97,9 @@ Kind-owned enum (core §6.2):
 ### 4.1 k8s-exec targets a PVC, not a pod
 
 Address stability. Pod references are a provider/adapter-side convention
-(`twill-ws-<k8sName(durable_id) of the consumer child or the provisioner—
-see the Worktree/Claim parenting convention for who owns what pod`; RFC
-1123-sanitized).
+(`twill-ws-<k8sName(storage.id)>` — RFC 1123-sanitized: lowercase,
+dashes, no underscores; the pod's lifecycle belongs to the provider that
+materialized the workspace; consumers never name pods directly).
 
 ## 5. Workspace lifecycle → status surface mapping
 
@@ -129,24 +129,33 @@ E2E loop a consumer's adapter runs (and every implementer must produce):
 1. `resolve(Workspace, name, consumer)` → `Attached` descriptor with
    `ready: false, provisionable: true` (selection is cheap and
    non-blocking; resolve never blocks on provisioning).
-2. The adapter POSTs a `Claim` document against the workspace
-   (parent = the workspace; `claimedOn` = its durable_id+fingerprint),
-   including any `parameters` the provider needs (`branch`,
-   `worktreeName`, etc.).
+2. The adapter GETs the workspace document (`GET /twill/v1alpha1/
+   Workspace/<name>`) to obtain `spec.workspace.storage.fingerprint`
+   (the resolve descriptor does not carry it), then POSTs a `Claim`
+   document against the workspace: `parent` = the resolved workspace
+   (which must exist — claims never name unmaterialized children);
+   `claimedOn` = `{fingerprint, durable_id}`; `spec.claim.route` = the
+   resolved route verbatim (which binds the claim to one provider);
+   `spec.claim.parameters` = whatever the provider needs to materialize
+   (`branch`, `worktreeName`, ...).
 3. The registry indexes the claim. The workspace's status surface now
-   includes the new claim in its `claimedBy`.
+   includes the new claim in its `claimedBy` (derived; core §9).
 4. **The provider polls `GET /twill/v1alpha1/claims?parent=<name>`**
-   (the provider-claim-read-path — part of the provider/registry
-   contract) and begins provisioning. As it works it pushes
-   `Workspace.statusReport` (vocabulary: `provisioning`, eventually
-   `ready`); the registry updates its cache.
+   (the provider-claim-read-path) filtered by its own bound routes, and
+   begins provisioning. As it works it pushes `Workspace.statusReport`
+   (`provisioning`, eventually `ready`); the registry updates its cache.
+   On success the provider PATCHes the **new child Workspace document**
+   into the registry (derived `storage.id`, parent set, fingerprint
+   matching the parent's) — the child object becomes resolvable from
+   that point.
 5. The adapter polls `resolve` at adapter-chosen interval (suggested
-   5–10s). The progressive descriptor returns changing `ready` values
+   5–10s). Descriptors reflect the changing `ready` values
    (`false` → `true`); when `ready: true` arrives, the adapter mints
    and uses the capability.
 6. On timeout the adapter gives up; the claim stays (visibility for
-   operators) until the consumer explicitly releases
-   (`DELETE`-or-release-mark of the Claim document).
+   operators) until the consumer explicitly releases it
+   (`PATCH /twill/v1alpha1/Claim/<name>` with `spec.claim.released:
+   true`).
 
 No special-case: cold workspaces are just "not ready yet, claim them,
 wait for provisioning to report `ready: true`," and the poll loop is
@@ -180,9 +189,12 @@ style, concrete substitution syntax is registry-implementation-owned).
   - `GET  /twill/v1alpha1` (discovery; core §10.3 shape)
   - `GET  /twill/v1alpha1/<kind>/<name>`
   - `POST /twill/v1alpha1/resolve`
-  - `POST /twill/v1alpha1/<kind>/<name>/claims` (consumer: create a claim)
-  - `GET  /twill/v1alpha1/claims?parent=<name>` (provider: read claims
-    against a parent)
+  - `POST /twill/v1alpha1/Claim/<name>` (consumer: create a claim)
+  - `PATCH /twill/v1alpha1/Claim/<name>` (consumer: release; provider:
+    author child documents on materialization)
+  - `GET  /twill/v1alpha1/claims?parent=<kind>/<name>` (provider: read
+    claims against a parent; parent is kind-qualified since names are
+    per-kind)
   - `POST /twill/v1alpha1/<kind>/<name>/statusReport` (provider push)
   - `GET  /twill/v1alpha1/health` (`{"documentSet": current|stale, ...}`)
   - `PATCH /twill/v1alpha1/<kind>/<name>` (v1-alpha)
