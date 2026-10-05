@@ -1,6 +1,6 @@
 # Twill — Workspace kind spec
 
-**Status:** Revision 9 — reviewed (SHIP-WITH-NITS 2026-10-05)
+**Status:** Revision 10 — reviewed (SHIP-WITH-NITS 2026-10-05) + §2.1 hand-minted-fingerprint guidance, §9.1 minimal deployment
 **Date:** 2026-10-04
 **Inherits:** `2026-10-04-twill-fabric-core.md` (revision 10, authoritative).
 This document instantiates; it does not restate or redefine core.
@@ -48,6 +48,17 @@ type:
 - `ssh`-backed: the workstation's machine-id (content-stable across
   reinstalls of the same host).
 - `k8s-exec`-backed: the PVC UID.
+
+Where no hardware identity exists — an NFS/SMB share, a hand-managed
+directory tree, a bind-mount whose backing volume is someone else's
+problem — the operator mints a stable value by hand
+(`fingerprint: vol-nas-repos`). The protocol requires only uniqueness
+and stability, not hardware provenance; a hand-minted value that
+uniquely names the physical share satisfies §8.3's aliasing detection
+exactly as a UUID does. The failure mode to avoid is reusing one
+fingerprint for two physically distinct volumes — that is precisely
+the corruption §8.3 exists to catch, and a hand-minted value makes that
+error cheap to make.
 
 ### 2.2 Git worktrees: first-class children
 
@@ -258,8 +269,43 @@ style, concrete substitution syntax is registry-implementation-owned).
 - In-cluster: Deployment + PVC (`itty-nfs-flashy`, 4Gi); ClusterIP for
   in-cluster; Tailscale LB for workstation consumers; documents from a
   ConfigMap; chart lives in the helm-charts repo.
-- Not-in-cluster: docker-compose with a bind-mount.
+- Not-in-cluster: docker-compose with a bind-mount. The documents
+  directory is a plain folder on the docker host (itself possibly an
+  NFS/SMB mount of a NAS share) with hand-written YAML; the gitops
+  layer is an editor. Hot workspaces are the norm here — see §9.1.
 - No operator in v1alpha1; `status:` stays empty.
+
+### 9.1 The minimal deployment (one container, a YAML folder)
+
+The smallest working twill is the registry container plus a documents
+directory; nothing else is required. In a homelab, workspaces are
+usually **hot by nature** — the NAS share exists, the repos directory
+exists, there is nothing to materialize — so providers come in three
+tiers of optional sophistication:
+
+1. **No provider at all.** A never-observed workspace takes the kind
+   default (`ready: false, provisionable: true`); since selectability
+   is `ready OR provisionable` (core §7), `resolve` still returns a
+   route. The adapter treats "never observed + route path exists" as
+   attachable. Cost: the status surface is advisory
+   (`"no provider report yet"`) and a share falling off the NAS is
+   indistinguishable from a healthy one.
+2. **A static-provider sidecar.** A small cron container in the same
+   compose file that POSTs `statusReport {ready: true}` per workspace
+   every 30s (optionally verifying the mount first). Co-locating
+   parties in one compose file is legitimate — the party model is
+   protocol-level, not process-level — and it makes the status
+   surface truthful for near-zero cost.
+3. **Real providers where they're real.** If the NAS itself runs
+   containers, a provider there can materialize git worktrees on the
+   NAS's own storage. Adopt per-host when the need appears.
+
+Nothing in the protocol forces cold workspaces or claims: claims, the
+writable overlay, and lazy materialization are additive layers over a
+core that hot workspaces and static routes already satisfy. Multiple
+static routes per workspace is the homelab norm — one `local` route
+per host that mounts the share, an `ssh` route for everything else —
+with one hand-minted fingerprint per physical share (§2.1).
 
 ## 10. Milestones
 
