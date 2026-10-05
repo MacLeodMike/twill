@@ -108,7 +108,7 @@ survey; the Card spec session must consciously respond to each:
 4. **AWCP dual state machine** (delegator 9-state, executor minimal) — informs
    how a claimed→executing→done handoff to a remote executor could be
    structured without twill keeping shared state.
-5. **Two claim models must compose, not collide.** Fabric-core rev 6 introduced
+5. **Two claim models must compose, not collide.** Fabric-core rev 8 introduced
    first-class `Claim` documents (children with `spec.claim.claimedOn`), and
    this note pins Card's own `claimed_by`/`claim_token`. When Card lands, the
    Card spec must decide explicitly: is `spec.card.claimed_by` superseded by

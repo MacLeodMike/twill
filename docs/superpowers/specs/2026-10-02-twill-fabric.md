@@ -18,8 +18,8 @@ parked:
 
 | Doc | Role | Status |
 |---|---|---|
-| `2026-10-04-twill-fabric-core.md` | The protocol: CRD wrapper, `storage.id` invariant, routes, resolve algorithm, version policy. **Nothing runnable.** Injects no kind-specific behavior. | draft revision 8, in dual review |
-| `2026-10-04-twill-workspace.md` | The Workspace kind: schemas, route types, `precondition`, adapters, deployment. Implementation target. | draft revision 7, in dual review |
+| `2026-10-04-twill-fabric-core.md` | The protocol: CRD wrapper, `storage.id` invariant, routes, resolve algorithm, version policy. **Nothing runnable.** Injects no kind-specific behavior. | draft revision 9, in dual review |
+| `2026-10-04-twill-workspace.md` | The Workspace kind: schemas, route types, `precondition`, adapters, deployment. Implementation target. | draft revision 9, in dual review |
 | `../research/2026-10-04-twill-card-holding-note.md` | Card / skuld schema pins + deferred-design notes. **Not a spec.** | done |
 | agent / mcp / skill kinds (§2, §7 here) | reserved only | unchanged |
 
@@ -92,7 +92,7 @@ features, not protocol revolutions.
 ### 2.1 Common shape
 
 All six kinds follow one form (CRD-forward). The concrete envelope is
-owned by `2026-10-04-twill-fabric-core.md` (§2): top-level `spec.` carries
+owned by `2026-10-04-twill-fabric-core.md` (§3): top-level `spec.` carries
 `owner`, `routes`, `spec.<kindname>`, and `parent` (children are first-class);
 details there. The load-bearing constraints for this document:
 `owner` is required from day one (a string now vs an ACL migration later);
@@ -203,7 +203,7 @@ provider materializes and reports state, consumer attaches — is core §2.
 This composite's §3.5 in earlier drafts carried resolver-run preconditions
 and resolver-invoked attach; that shape is now recognized as unimplementable
 (registry can't reach consumer-local routes, can't serialize a capability),
-and the party-model of core rev 4 is the replacement.
+and the party-model of core §2 is the replacement.
 
 The `consumer` tuple is `{ agentLocation, agentKind, principal }`, each a
 string. Match on the runtime family (`pi`, `hermes`), not a versioned

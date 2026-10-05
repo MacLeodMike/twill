@@ -1,8 +1,8 @@
 # Twill — Workspace kind spec
 
-**Status:** Draft (revision 7 — e2e loop closed + overlay persistence)
+**Status:** Draft (revision 8 — child-id determinism + write validation)
 **Date:** 2026-10-04
-**Inherits:** `2026-10-04-twill-fabric-core.md` (revision 8, authoritative).
+**Inherits:** `2026-10-04-twill-fabric-core.md` (revision 9, authoritative).
 This document instantiates; it does not restate or redefine core.
 **Scope:** the `Workspace` kind — schema, lifecycle mapping, route types,
 preconditions, adapters, deployment.
@@ -144,18 +144,25 @@ E2E loop a consumer's adapter runs (and every implementer must produce):
 4. **The provider polls `GET /twill/v1alpha1/claims?parent=Workspace/<name>`**
    (kind-qualified parent reference; the provider-claim-read-path)
    filtered by its own bound routes (exact route-object match on
-   `spec.claim.route`), and begins provisioning. While provisioning it
+   `spec.claim.route`), skipping claims with `spec.claim.released: true`,
+   and begins provisioning. While provisioning it
    pushes `statusReport` against the **parent** (`provisioning`); on
    success the provider PATCHes the **new child Workspace document** into
    the registry (upsert; the overlay) with:
    - `metadata.name` = `<parent-name>-<worktreeName>` (deterministic;
      the consumer can compute it from its own claim parameters)
-   - `spec.workspace.storage.id` derived from the parent's per core §4.3
+   - `spec.workspace.storage.id` = a pure function of the parent's
+     `storage.id` and `worktreeName` (`<parent-storage.id>-<worktreeName>`)
+     — deterministic, so a duplicate claim for the same worktree re-yields
+     the same child id rather than minting a divergent one
    - `spec.parent` = the parent workspace
    - `fingerprint` = the parent's
-   - `routes` = the claim's `spec.claim.route` verbatim (the provider
-     binds the child to the same mechanism the consumer resolved through)
-   and then pushes `statusReport` against the **child** (`ready`).
+   - `routes` = the claim's `spec.claim.route` **mechanism fields
+     verbatim, with `path` replaced by the materialized child path**
+     (the claim's route points at the parent's storage root; the child's
+     route must point at the worktree)
+   and then pushes `statusReport` against the **child** (`ready`), and a
+   final parent `statusReport` restoring the parent's own state.
 5. The adapter computes the expected child name from its own claim
    parameters (`<parent-name>-<worktreeName>`) and polls
    `resolve(Workspace, <child-name>, consumer)` at adapter-chosen
@@ -201,8 +208,7 @@ style, concrete substitution syntax is registry-implementation-owned).
   - `GET  /twill/v1alpha1/<kind>/<name>`
   - `POST /twill/v1alpha1/resolve`
   - `POST /twill/v1alpha1/Claim/<name>` (consumer: create a claim)
-  - `PATCH /twill/v1alpha1/Claim/<name>` (consumer: release; provider:
-    author child documents on materialization)
+  - `PATCH /twill/v1alpha1/Claim/<name>` (consumer: release)
   - `GET  /twill/v1alpha1/claims?parent=<kind>/<name>` (provider: read
     claims against a parent; parent is kind-qualified since names are
     per-kind)
@@ -221,10 +227,15 @@ style, concrete substitution syntax is registry-implementation-owned).
   Workspaces) live in a **writable overlay**: a JSONL file on the
   registry's PVC, merged over the watched source at read time. Union
   semantics: the document set is `watched ∪ overlay`; on name collision
-  the overlay wins; the overlay survives restarts (claims and materialized
+  the overlay wins (and the shadowing is reported in `/health`'s
+  `warnings`); the overlay survives restarts (claims and materialized
   children are durable, not cache). `PATCH` is upsert on the document
-  surface (a `PATCH` against a not-yet-existing name creates the document).
-  The §8.3 document set means the union.
+  surface (a `PATCH` against a not-yet-existing name creates the
+  document). **Writes are validated before append**: a write whose
+  merged result would violate §8.3 (fingerprint collision without
+  lineage, duplicate durable id, parent cycle) is rejected with an error
+  to the writer, never persisted — one bad PATCH cannot poison every
+  subsequent reload. The §8.3 document set means the union.
 
 ## 9. Deployment
 

@@ -1,6 +1,6 @@
 # Twill fabric core — the protocol
 
-**Status:** Draft (revision 8 — persistence overlay + loop closure)
+**Status:** Draft (revision 9 — lineage self-inclusion + write validation)
 **Date:** 2026-10-04
 **Scope:** The **agent-agnostic workspace fabric protocol only**. Weakest-link
 doc: every kind spec inherits and may not restate or redefine it. This doc is
@@ -243,6 +243,16 @@ the registry's query timeout yields the cached entry with
 staleness: `claimedBy` is document-derived (§9), not provider-derived,
 so provider hang does not vanish existing claims.
 
+**Never-observed documents.** A document whose provider has never
+reported (no cache entry, no live answer — e.g. a freshly registered
+workspace whose provider hasn't polled yet) takes the kind spec's
+declared **default status**: for Workspace, `ready: false,
+provisionable: true` (a registered workspace is presumed lazily
+materializable until the provider says otherwise), `claimedBy: []`,
+`source: cached`, `progress: "no provider report yet"`. Each kind spec
+declares its own default; the registry applies it without contacting
+the provider.
+
 The cache has a TTL, kind-spec-tunable (v1alpha1: 60s).
 
 ## 8.3 Load-time and reload-time reject (the lineage rule)
@@ -252,29 +262,32 @@ conflict on identity, where conflict is computed as:
 
 - **Fingerprint collision without lineage**: two documents share a
   populated `storage.fingerprint` and have different `storage.id`s, AND
-  their ancestor sets do not intersect. Lineage is computed over
-  `spec.parent` **name references** (kind+name), transitively, and does
-  **not** require ancestor documents to be present in the document set —
-  a partial set with siblings whose root is absent still computes
-  intersecting ancestor sets from the references alone. Cycle rejection
-  (§4.2) precedes lineage computation. Parent/child pairs and siblings
-  under one root are the declared-alias case and load cleanly; two
-  *unrelated* roots claiming one physical volume are the corruption case
-  and are rejected.
+  their ancestor sets do not intersect. A document's **ancestor set is
+  self-inclusive**: the document itself plus its transitive `spec.parent`
+  references (kind+name), computed over name references only — ancestor
+  documents need not be present in the set. Cycle rejection (§4.2)
+  precedes lineage computation. Parent/child pairs and siblings under one
+  root are the declared-alias case and load cleanly; two *unrelated*
+  roots claiming one physical volume are the corruption case and are
+  rejected.
 - **Duplicate durable id**: two documents carry the same durable id
   (`storage.id` or `<kindname>.id`) — always rejected regardless of
   fingerprint or lineage.
 - **Orphan claims are not rejections**: a Claim whose parent reference
   does not resolve in the document set (parent deleted while the claim
-  persisted) is marked inert and reported in the health surface
-  (`reason` names the orphan claims), never a set-level rejection —
-  one crashed consumer must not be able to brick the registry.
+  persisted) is marked inert and reported in the health surface's
+  `warnings` field (`GET /twill/v1alpha1/health` → `{"documentSet":
+  "current", "warnings": [{orphan claim refs}]}`), never a set-level
+  rejection — one crashed consumer must not be able to brick the
+  registry.
 
 On rejection the registry serves the **last-good document set** (no hard
 exit; single-replica availability prevails), reports its degraded surface
-(`GET /twill/v1alpha1/health` → `{"documentSet": "stale", "rejectedAt":
-<rfc3339>, "reason": ...}`; on a valid set it returns
-`{"documentSet": "current"}`), and logs the rejection. Cold start with a
+(`GET /twill/v1alpha1/health` → `{"documentSet": "stale",
+"rejectedAt": <rfc3339>, "reason": ...}`; on a valid set it returns
+`{"documentSet": "current", "warnings": [...]}` — `warnings` is the
+non-rejecting report channel, used for orphan claims and for
+overlay-shadowed watched-source edits), and logs the rejection. Cold start with a
 rejected set: serve the **empty** registry, `documentSet: stale`, log the
 rejection. Kind specs decide what "the document set" means (watched
 ConfigMap, bind-mount, or both).
@@ -317,7 +330,7 @@ spec:
       branch: feat-x
       worktreeName: feat-x                    # parameters the provider
                                               # materializes from
-    claimedOn: {fingerprint: vol-2c4f1a, durable_id: "ws_01J8Z4"}
+    claimedOn: {fingerprint: vol-2c4f1a, durable_id: "ws_01J8Z4-payments-repo"}
     released: false                           # set true to release (PATCH)
   parent: { kind: Workspace, name: payments-repo }
 status: {}
@@ -331,8 +344,9 @@ Rules:
   the child's identity (`branch`, `worktreeName`, ...) is carried in
   `spec.claim.parameters`, and the **provider authors the child document**
   once materialization succeeds (via the registry's document surface).
-  Claims referencing missing parents are loader-rejected, with no lazy-
-  materialization exemption — the parent must exist.
+  Missing parents are rejected at **POST time** (create-time validation,
+  immediate error); a parent deleted *after* the claim exists yields an
+  inert orphan claim per §8.3, not a set-level rejection.
 - `spec.claim.route` records which resolved route (and therefore which
   provider handle) the claim binds; the provider claims read-path filters
   on it, so two providers backing one fingerprint never both materialize.
@@ -341,9 +355,11 @@ Rules:
 - `claimedOn` carries fingerprint + durable_id (§8.4); fingerprint is
   absent for non-storage-backed kinds.
 - Claims are **document-derived**: the registry derives `claimedBy`
-  (elements `{name, owner, claimedOn}`) from all un-released Claim
-  documents of a given `claimedOn` — the provider's statusReport updates
-  `ready`/`provisionable`/`progress`/`asOf` but never carries `claimedBy`.
+  (elements `{name, owner, principal, claimedOn}`) from all un-released
+  Claim documents of a given `claimedOn` key (fingerprint for
+  storage-backed kinds, durable id otherwise — §8.4) — the provider's
+  statusReport updates `ready`/`provisionable`/`progress`/`asOf` but
+  never carries `claimedBy`.
 - **Release**: consumers release via `PATCH` on their Claim document
   setting `spec.claim.released: true`. The registry's next status
   surface computation removes it from `claimedBy`.
