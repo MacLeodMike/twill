@@ -1,6 +1,6 @@
 # Twill fabric core — the protocol
 
-**Status:** Draft (revision 7 — §8.3 lineage rule + claim transport closure)
+**Status:** Draft (revision 8 — persistence overlay + loop closure)
 **Date:** 2026-10-04
 **Scope:** The **agent-agnostic workspace fabric protocol only**. Weakest-link
 doc: every kind spec inherits and may not restate or redefine it. This doc is
@@ -221,7 +221,7 @@ per §10.1):
 |---|---|---|
 | `ready` | bool | "a consumer may attach now" (kind-mapped from the provider's lifecycle) |
 | `provisionable` | bool | "the provider can lazily materialize on demand" (kind-mapped) |
-| `claimedBy` | `[claims]` | who currently holds claims (derived from Claim documents — see §9); each element is `{name, owner, claimedOn}` — the Claim's metadata.name, its `spec.owner`, and its `spec.claim.claimedOn` |
+| `claimedBy` | `[claims]` | who currently holds claims (derived from Claim documents — see §9); each element is `{name, owner, principal, claimedOn}` — the Claim's metadata.name, `spec.owner`, `spec.claim.principal`, and `spec.claim.claimedOn`. Adapters identify their own claims by `principal` |
 | `progress` | string | kind-owned free-form text for humans; advisory, never parsed |
 | `asOf` | rfc3339 | the provider-reported observation time |
 | `source` | `live` \| `cached` | registry-set: which side of the cache this observation came from |
@@ -252,17 +252,23 @@ conflict on identity, where conflict is computed as:
 
 - **Fingerprint collision without lineage**: two documents share a
   populated `storage.fingerprint` and have different `storage.id`s, AND
-  the two are **not** in a common lineage — i.e. neither is a
-  `spec.parent`-chain ancestor of the other, and they do not share a
-  common ancestor carrying that fingerprint. Lineage is computable from
-  the document set (follow `spec.parent` chains; two documents are in a
-  common lineage iff their ancestor sets intersect). Parent/child pairs
-  and siblings under one root are the declared-alias case and load
-  cleanly; two *unrelated* roots claiming one physical volume are the
-  corruption case and are rejected.
+  their ancestor sets do not intersect. Lineage is computed over
+  `spec.parent` **name references** (kind+name), transitively, and does
+  **not** require ancestor documents to be present in the document set —
+  a partial set with siblings whose root is absent still computes
+  intersecting ancestor sets from the references alone. Cycle rejection
+  (§4.2) precedes lineage computation. Parent/child pairs and siblings
+  under one root are the declared-alias case and load cleanly; two
+  *unrelated* roots claiming one physical volume are the corruption case
+  and are rejected.
 - **Duplicate durable id**: two documents carry the same durable id
   (`storage.id` or `<kindname>.id`) — always rejected regardless of
   fingerprint or lineage.
+- **Orphan claims are not rejections**: a Claim whose parent reference
+  does not resolve in the document set (parent deleted while the claim
+  persisted) is marked inert and reported in the health surface
+  (`reason` names the orphan claims), never a set-level rejection —
+  one crashed consumer must not be able to brick the registry.
 
 On rejection the registry serves the **last-good document set** (no hard
 exit; single-replica availability prevails), reports its degraded surface
@@ -277,14 +283,14 @@ ConfigMap, bind-mount, or both).
 
 A claim's occupancy identity is `claimedOn: {fingerprint, durable_id}` —
 the fingerprint of the storage the claim occupies, plus the durable id of
-the object it was claimed against. For storage-backed kinds the
-fingerprint is the level exclusivity operates at: two Workspaces with
-the same fingerprint see each other's claims regardless of which route
-either consumer resolved through. `claimedOn` is what makes RWO
-exclusive across views (including parent+child views of the same pool).
-**Non-storage-backed kinds use the durable id and leave `fingerprint`
-absent/empty** (there is no physical volume to occupy; exclusivity on
-e.g. a Card is per-object by definition).
+the object it was claimed against. **`claimedBy` derivation keys on
+`fingerprint` for storage-backed kinds and on `durable_id` for
+non-storage-backed kinds**: two Workspaces with the same fingerprint see
+each other's claims regardless of which route or which parent/child view
+either consumer resolved through. That is what makes RWO exclusive across
+views (including parent+child views of the same pool). **Non-storage-
+backed kinds leave `fingerprint` absent/empty** (there is no physical
+volume to occupy; exclusivity on e.g. a Card is per-object by definition).
 
 ## 9. Claims are first-class children
 
@@ -302,8 +308,11 @@ spec:
   claim:
     storageBacked: false
     id: cl_...
+    principal: "pi/0.99.1@workstation"        # the claiming consumer identity
     route: { type: ssh, address: "..." }      # the resolved route this claim binds
-                                              # (which provider is on the hook)
+                                              # (which provider is on the hook);
+                                              # provider binding = exact match on
+                                              # the route object as returned
     parameters:
       branch: feat-x
       worktreeName: feat-x                    # parameters the provider

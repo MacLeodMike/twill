@@ -1,8 +1,8 @@
 # Twill — Workspace kind spec
 
-**Status:** Draft (revision 6 — claim transport + child authoring path)
+**Status:** Draft (revision 7 — e2e loop closed + overlay persistence)
 **Date:** 2026-10-04
-**Inherits:** `2026-10-04-twill-fabric-core.md` (revision 7, authoritative).
+**Inherits:** `2026-10-04-twill-fabric-core.md` (revision 8, authoritative).
 This document instantiates; it does not restate or redefine core.
 **Scope:** the `Workspace` kind — schema, lifecycle mapping, route types,
 preconditions, adapters, deployment.
@@ -134,24 +134,35 @@ E2E loop a consumer's adapter runs (and every implementer must produce):
    (the resolve descriptor does not carry it), then POSTs a `Claim`
    document against the workspace: `parent` = the resolved workspace
    (which must exist — claims never name unmaterialized children);
+   `spec.claim.principal` = the consumer's identity string;
    `claimedOn` = `{fingerprint, durable_id}`; `spec.claim.route` = the
    resolved route verbatim (which binds the claim to one provider);
    `spec.claim.parameters` = whatever the provider needs to materialize
    (`branch`, `worktreeName`, ...).
 3. The registry indexes the claim. The workspace's status surface now
    includes the new claim in its `claimedBy` (derived; core §9).
-4. **The provider polls `GET /twill/v1alpha1/claims?parent=<name>`**
-   (the provider-claim-read-path) filtered by its own bound routes, and
-   begins provisioning. As it works it pushes `Workspace.statusReport`
-   (`provisioning`, eventually `ready`); the registry updates its cache.
-   On success the provider PATCHes the **new child Workspace document**
-   into the registry (derived `storage.id`, parent set, fingerprint
-   matching the parent's) — the child object becomes resolvable from
-   that point.
-5. The adapter polls `resolve` at adapter-chosen interval (suggested
-   5–10s). Descriptors reflect the changing `ready` values
-   (`false` → `true`); when `ready: true` arrives, the adapter mints
-   and uses the capability.
+4. **The provider polls `GET /twill/v1alpha1/claims?parent=Workspace/<name>`**
+   (kind-qualified parent reference; the provider-claim-read-path)
+   filtered by its own bound routes (exact route-object match on
+   `spec.claim.route`), and begins provisioning. While provisioning it
+   pushes `statusReport` against the **parent** (`provisioning`); on
+   success the provider PATCHes the **new child Workspace document** into
+   the registry (upsert; the overlay) with:
+   - `metadata.name` = `<parent-name>-<worktreeName>` (deterministic;
+     the consumer can compute it from its own claim parameters)
+   - `spec.workspace.storage.id` derived from the parent's per core §4.3
+   - `spec.parent` = the parent workspace
+   - `fingerprint` = the parent's
+   - `routes` = the claim's `spec.claim.route` verbatim (the provider
+     binds the child to the same mechanism the consumer resolved through)
+   and then pushes `statusReport` against the **child** (`ready`).
+5. The adapter computes the expected child name from its own claim
+   parameters (`<parent-name>-<worktreeName>`) and polls
+   `resolve(Workspace, <child-name>, consumer)` at adapter-chosen
+   interval (suggested 5–10s). Before the child exists the poll returns
+   `NoMatch`; once the child document appears it returns the child's
+   descriptor; when `ready: true` arrives, the adapter mints and uses
+   the capability against the child's route.
 6. On timeout the adapter gives up; the claim stays (visibility for
    operators) until the consumer explicitly releases it
    (`PATCH /twill/v1alpha1/Claim/<name>` with `spec.claim.released:
@@ -203,7 +214,17 @@ style, concrete substitution syntax is registry-implementation-owned).
 - Load-reject / reload: core §8.3's rule — fingerprint-sibling pairs
   un-rejected; aliasing pairs without lineage rejected; serve-last-good;
   `/health` reports current/stale.
-- Sources: ConfigMap or bind-mount; watch them.
+- Sources and the writable overlay: the **watched source** (ConfigMap or
+  bind-mount) is read-only to the registry — Flux or the operator owns it,
+  and the registry never writes it. API-written documents (consumer
+  `POST`/`PATCH` of Claims, provider `PATCH` of materialized child
+  Workspaces) live in a **writable overlay**: a JSONL file on the
+  registry's PVC, merged over the watched source at read time. Union
+  semantics: the document set is `watched ∪ overlay`; on name collision
+  the overlay wins; the overlay survives restarts (claims and materialized
+  children are durable, not cache). `PATCH` is upsert on the document
+  surface (a `PATCH` against a not-yet-existing name creates the document).
+  The §8.3 document set means the union.
 
 ## 9. Deployment
 

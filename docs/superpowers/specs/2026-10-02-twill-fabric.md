@@ -18,8 +18,8 @@ parked:
 
 | Doc | Role | Status |
 |---|---|---|
-| `2026-10-04-twill-fabric-core.md` | The protocol: CRD wrapper, `storage.id` invariant, routes, resolve algorithm, version policy. **Nothing runnable.** Injects no kind-specific behavior. | drafted 2026-10-04, in review |
-| `2026-10-04-twill-workspace.md` | The Workspace kind: schemas, route types, `precondition`, adapters, deployment. Implementation target. | draft revision 5, in dual review |
+| `2026-10-04-twill-fabric-core.md` | The protocol: CRD wrapper, `storage.id` invariant, routes, resolve algorithm, version policy. **Nothing runnable.** Injects no kind-specific behavior. | draft revision 8, in dual review |
+| `2026-10-04-twill-workspace.md` | The Workspace kind: schemas, route types, `precondition`, adapters, deployment. Implementation target. | draft revision 7, in dual review |
 | `../research/2026-10-04-twill-card-holding-note.md` | Card / skuld schema pins + deferred-design notes. **Not a spec.** | done |
 | agent / mcp / skill kinds (§2, §7 here) | reserved only | unchanged |
 
