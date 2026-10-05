@@ -1,6 +1,6 @@
 # Twill fabric core — the protocol
 
-**Status:** Draft (revision 9 — lineage self-inclusion + write validation)
+**Status:** Draft (revision 10 — lineage presence + P2 sweep)
 **Date:** 2026-10-04
 **Scope:** The **agent-agnostic workspace fabric protocol only**. Weakest-link
 doc: every kind spec inherits and may not restate or redefine it. This doc is
@@ -92,8 +92,9 @@ use `spec.<kindname>.id`. Minted once at creation, immutable under rename,
 never recycled. What the id identifies is kind-defined.
 
 **Derived child ids.** Storage-backed kinds: a child's `storage.id` MUST
-incorporate the parent's (e.g. `ws_01J8Z4-feat-x` is a child of
-`ws_01J8Z4-...`) and MUST differ (children are views, not aliases). A
+incorporate the parent's (e.g. `ws_01J8Z4-payments-repo-feat-x` is a
+worktree child of `ws_01J8Z4-payments-repo`) and MUST differ (children
+are views, not aliases). A
 child's `storage.fingerprint` MUST equal the parent's (same physical
 volume). Whether documents sharing a `fingerprint` are load-accepted or
 rejected is governed by the lineage rule (§8.3).
@@ -248,10 +249,10 @@ reported (no cache entry, no live answer — e.g. a freshly registered
 workspace whose provider hasn't polled yet) takes the kind spec's
 declared **default status**: for Workspace, `ready: false,
 provisionable: true` (a registered workspace is presumed lazily
-materializable until the provider says otherwise), `claimedBy: []`,
-`source: cached`, `progress: "no provider report yet"`. Each kind spec
-declares its own default; the registry applies it without contacting
-the provider.
+materializable until the provider says otherwise), `source: cached`,
+`progress: "no provider report yet"`. `claimedBy` is always derived
+from Claim documents (§9), never defaulted. Each kind spec declares its
+own default; the registry applies it without contacting the provider.
 
 The cache has a TTL, kind-spec-tunable (v1alpha1: 60s).
 
@@ -262,14 +263,17 @@ conflict on identity, where conflict is computed as:
 
 - **Fingerprint collision without lineage**: two documents share a
   populated `storage.fingerprint` and have different `storage.id`s, AND
-  their ancestor sets do not intersect. A document's **ancestor set is
-  self-inclusive**: the document itself plus its transitive `spec.parent`
-  references (kind+name), computed over name references only — ancestor
-  documents need not be present in the set. Cycle rejection (§4.2)
-  precedes lineage computation. Parent/child pairs and siblings under one
-  root are the declared-alias case and load cleanly; two *unrelated*
-  roots claiming one physical volume are the corruption case and are
-  rejected.
+  their ancestor sets do not intersect **at a document present in the
+  set**. A document's **ancestor set is self-inclusive**: the document
+  itself plus its transitive `spec.parent` references (kind+name).
+  Lineage is conferred only by an intersecting ancestor that is **loaded
+  in the document set** — two documents citing the same *missing* parent
+  name share no lineage (otherwise two unrelated roots could bypass
+  rejection by copy-pasting a fictitious common parent). Cycle rejection
+  (§4.2) precedes lineage computation. Parent/child pairs and siblings
+  under one present root are the declared-alias case and load cleanly;
+  two *unrelated* roots claiming one physical volume are the corruption
+  case and are rejected.
 - **Duplicate durable id**: two documents carry the same durable id
   (`storage.id` or `<kindname>.id`) — always rejected regardless of
   fingerprint or lineage.

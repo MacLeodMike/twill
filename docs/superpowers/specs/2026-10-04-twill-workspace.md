@@ -1,8 +1,8 @@
 # Twill — Workspace kind spec
 
-**Status:** Draft (revision 8 — child-id determinism + write validation)
+**Status:** Draft (revision 9 — route-copy precision + P2 sweep)
 **Date:** 2026-10-04
-**Inherits:** `2026-10-04-twill-fabric-core.md` (revision 9, authoritative).
+**Inherits:** `2026-10-04-twill-fabric-core.md` (revision 10, authoritative).
 This document instantiates; it does not restate or redefine core.
 **Scope:** the `Workspace` kind — schema, lifecycle mapping, route types,
 preconditions, adapters, deployment.
@@ -51,6 +51,10 @@ type:
 
 ### 2.2 Git worktrees: first-class children
 
+Kind-crossing rule: a Workspace's `spec.parent` must be a Workspace
+(parent pools or repo workspaces). Claims parent Workspaces; Workspaces
+never parent Cards or vice versa.
+
 A git worktree of a repo workspace is its own Workspace document
 (core §4.2, §4.3):
 
@@ -67,7 +71,7 @@ spec:
     storageBacked: true
     accessMode: RWO
     storage:
-      id:        ws_01J8Z4-feat-x             # derived from parent's ws_01J8Z4-...
+      id:        ws_01J8Z4-payments-repo-feat-x  # <parent-storage.id>-<worktreeName>
       fingerprint: vol-2c4f1a                  # matches parent (same volume)
   parent: { kind: Workspace, name: payments-repo }
 ```
@@ -157,10 +161,11 @@ E2E loop a consumer's adapter runs (and every implementer must produce):
      the same child id rather than minting a divergent one
    - `spec.parent` = the parent workspace
    - `fingerprint` = the parent's
-   - `routes` = the claim's `spec.claim.route` **mechanism fields
-     verbatim, with `path` replaced by the materialized child path**
-     (the claim's route points at the parent's storage root; the child's
-     route must point at the worktree)
+   - `routes` = the claim's `spec.claim.route` copied with **two
+     changes**: `path` is replaced by the materialized child path, and
+     `precondition` is dropped (the child is already materialized).
+     `match` and `type` are preserved exactly — the child stays scoped
+     to the claiming consumer's agentLocation
    and then pushes `statusReport` against the **child** (`ready`), and a
    final parent `statusReport` restoring the parent's own state.
 5. The adapter computes the expected child name from its own claim
