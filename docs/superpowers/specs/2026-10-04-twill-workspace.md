@@ -1,6 +1,6 @@
 # Twill — Workspace kind spec
 
-**Status:** Draft (revision 9 — route-copy precision + P2 sweep)
+**Status:** Revision 9 — reviewed (SHIP-WITH-NITS 2026-10-05)
 **Date:** 2026-10-04
 **Inherits:** `2026-10-04-twill-fabric-core.md` (revision 10, authoritative).
 This document instantiates; it does not restate or redefine core.
@@ -174,7 +174,10 @@ E2E loop a consumer's adapter runs (and every implementer must produce):
    interval (suggested 5–10s). Before the child exists the poll returns
    `NoMatch`; once the child document appears it returns the child's
    descriptor; when `ready: true` arrives, the adapter mints and uses
-   the capability against the child's route.
+   the capability against the child's route. (For claims with no
+   worktree parameters — claiming a cold *root* itself — there is no
+   child: the provider materializes the parent, reports `ready` on the
+   parent, and the adapter keeps polling the parent's name.)
 6. On timeout the adapter gives up; the claim stays (visibility for
    operators) until the consumer explicitly releases it
    (`PATCH /twill/v1alpha1/Claim/<name>` with `spec.claim.released:
@@ -241,6 +244,14 @@ style, concrete substitution syntax is registry-implementation-owned).
   lineage, duplicate durable id, parent cycle) is rejected with an error
   to the writer, never persisted — one bad PATCH cannot poison every
   subsequent reload. The §8.3 document set means the union.
+  **Claim collision rule**: `POST` against an existing Claim name is
+  rejected; `PATCH` on a Claim is restricted to setting
+  `spec.claim.released` — a live claim cannot be silently overwritten
+  by another consumer.
+- Provider↔document binding is deployment-configured in v1alpha1: the
+  registry's own config states which provider handles which workspaces
+  (a label convention, e.g. `twill/provider: <name>`, is the natural
+  encoding); provider discovery is v2.
 
 ## 9. Deployment
 

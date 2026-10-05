@@ -1,6 +1,6 @@
 # Twill fabric core — the protocol
 
-**Status:** Draft (revision 10 — lineage presence + P2 sweep)
+**Status:** Revision 10 — reviewed (10 rounds, SHIP-WITH-NITS 2026-10-05)
 **Date:** 2026-10-04
 **Scope:** The **agent-agnostic workspace fabric protocol only**. Weakest-link
 doc: every kind spec inherits and may not restate or redefine it. This doc is
@@ -247,12 +247,13 @@ so provider hang does not vanish existing claims.
 **Never-observed documents.** A document whose provider has never
 reported (no cache entry, no live answer — e.g. a freshly registered
 workspace whose provider hasn't polled yet) takes the kind spec's
-declared **default status**: for Workspace, `ready: false,
-provisionable: true` (a registered workspace is presumed lazily
-materializable until the provider says otherwise), `source: cached`,
-`progress: "no provider report yet"`. `claimedBy` is always derived
-from Claim documents (§9), never defaulted. Each kind spec declares its
-own default; the registry applies it without contacting the provider.
+declared **default status** (e.g. the Workspace kind declares
+`ready: false, provisionable: true` — a registered workspace is presumed
+lazily materializable until the provider says otherwise),
+`source: cached`, `progress: "no provider report yet"`. `claimedBy` is
+always derived from Claim documents (§9), never defaulted. Each kind
+spec declares its own default; the registry applies it without
+contacting the provider.
 
 The cache has a TTL, kind-spec-tunable (v1alpha1: 60s).
 
