@@ -1,5 +1,5 @@
 import { describe, it, expect } from "vitest";
-import { mkdtempSync, mkdirSync, writeFileSync, rmSync, readFileSync } from "node:fs";
+import { chmodSync, mkdtempSync, mkdirSync, writeFileSync, rmSync, readFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, dirname, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -176,6 +176,49 @@ status: {}
       cleanup(dir);
     }
   });
+
+  // chmod 000 blocks readdirSync for non-root only; as root the guard is
+  // unreachable, so the test has nothing to pin.
+  const runningAsRoot = typeof process.getuid === "function" && process.getuid() === 0;
+  it.skipIf(runningAsRoot)(
+    "an unreadable kind subdirectory records a LoadProblem and the rest of the batch still loads",
+    () => {
+      const dir = tempDocuments();
+      const kindDir = join(dir, "Workspace");
+      try {
+        write(dir, "Workspace/good.yaml", workspaceYaml("good", "ws_test-good"));
+        write(
+          dir,
+          "Card/epic.yaml",
+          `apiVersion: twill.bitwiseoperations.ca/v1alpha1
+kind: Card
+metadata: { name: epic }
+spec:
+  owner: user:test
+  routes: []
+  card: { id: card_test-epic }
+status: {}
+`,
+        );
+        chmodSync(kindDir, 0o000);
+
+        const { documents, problems } = loadDirectory(dir);
+
+        // The other kind dir loads; the unreadable one is a problem, not a throw.
+        expect(documents.map((d) => d.name)).toEqual(["epic"]);
+        expect(problems).toHaveLength(1);
+        expect(problems[0]!.path).toBe(kindDir);
+        expect(problems[0]!.reason).toContain("unreadable");
+      } finally {
+        try {
+          chmodSync(kindDir, 0o700); // restore so cleanup can descend
+        } catch {
+          // kindDir may not exist if setup failed before the chmod
+        }
+        cleanup(dir);
+      }
+    },
+  );
 
   it("unparseable or non-object YAML becomes a LoadProblem; other files still load", () => {
     const dir = tempDocuments();

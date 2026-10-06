@@ -3,6 +3,10 @@
 //   resolve(kind, name, consumer) -> Attached | NoMatch | Unreachable:
 //     obj    <- registry.get(kind, name)
 //     if obj is missing: return NoMatch(kind, name, consumer)
+//     if obj is inert (resolvable false): return NoMatch — an unresolvable
+//       document must not resolve (core §10.3's coherent reading: inert is
+//       listed in discovery with resolvable: false; resolving it anyway
+//       would contradict the listing)
 //     routes <- obj.spec.routes.filter(matches(r.match, consumer))
 //     if routes is empty: return NoMatch(obj, consumer)
 //     errors <- []
@@ -51,7 +55,7 @@ export type ResolveResult =
 
 export function resolve(kind: Kind, name: string, consumer: Consumer, store: ResolveStore): ResolveResult {
   const doc = store.get(kind, name);
-  if (doc === undefined) return { result: "NoMatch" };
+  if (doc === undefined || !doc.resolvable) return { result: "NoMatch" };
 
   const routes = doc.routes.filter((route) => matches(route["match"], consumer));
   if (routes.length === 0) return { result: "NoMatch" };

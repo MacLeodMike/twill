@@ -75,7 +75,16 @@ export function loadDirectory(dir: string): LoadResult {
 }
 
 function loadKindDir(dir: string, _kind: Kind, documents: FabricDocument[], problems: LoadProblem[]): void {
-  for (const entry of readdirSync(dir)) {
+  // Same contract as the top-level guard: an unreadable kind directory is
+  // a LoadProblem, never a throw out of reload().
+  let entries: string[];
+  try {
+    entries = readdirSync(dir);
+  } catch (err) {
+    problems.push({ path: dir, reason: `kind directory unreadable: ${String(err)}` });
+    return;
+  }
+  for (const entry of entries) {
     const path = join(dir, entry);
     const stats = safeStat(path, problems);
     if (stats === null) continue;

@@ -213,6 +213,19 @@ describe("(c) POST /resolve — unknown name", () => {
   });
 });
 
+describe("(c') POST /resolve — inert document", () => {
+  it("an inert document with routes resolves NoMatch (inert suppresses resolution; core §10.3)", async () => {
+    const { base } = await boot(writeExtraDocs);
+    const res = await post(base, "/resolve", {
+      kind: "Workspace",
+      name: "ghost-ws",
+      consumer: workstationConsumer,
+    });
+    expect(res.status).toBe(200);
+    expect(await res.json()).toEqual({ result: "NoMatch" });
+  });
+});
+
 describe("(d) GET /<kind>/<name> — the stored document", () => {
   it("serves the verbatim envelope (doc.raw), 404 for unknown name/kind", async () => {
     const { base } = await boot();
@@ -305,6 +318,13 @@ describe("(g) claims surface — 501 with the T2 milestone message", () => {
     const res = await fetch(`${base}/claims?parent=Workspace/workstation-repos`);
     expect(res.status).toBe(501);
     expect(await res.json()).toEqual({ error: "claims unimplemented in T1 milestone", milestone: "T2" });
+  });
+
+  it("DELETE /Claim/<name> → 404 (the 501 is method-scoped; other methods fall through)", async () => {
+    const { base } = await boot();
+    const res = await fetch(`${base}/Claim/x`, { method: "DELETE" });
+    expect(res.status).toBe(404);
+    expect(((await res.json()) as { error: string }).error).toContain("DELETE");
   });
 });
 

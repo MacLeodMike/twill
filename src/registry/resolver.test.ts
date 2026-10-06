@@ -16,10 +16,10 @@ const clusterConsumer: Consumer = { agentLocation: "cluster", agentKind: "pi", p
 function fixtureStore(): ResolveStore {
   const { documents } = loadDirectory(fixtures);
   return {
-    get: (kind, name) => {
-      const doc = documents.find((d) => d.kind === kind && d.name === name);
-      return doc === undefined || !doc.resolvable ? undefined : doc;
-    },
+    // Production semantics (RegistryStore.get answers from the snapshot
+    // regardless of resolvable) — inert suppression is the resolver's job,
+    // not the store's; a stub that hides inert docs masks the guard.
+    get: (kind, name) => documents.find((d) => d.kind === kind && d.name === name),
     statusCache: new Map(),
   };
 }
@@ -78,6 +78,18 @@ describe("resolve (core §7)", () => {
 
   it("(c) unknown name → NoMatch", () => {
     const result = resolveWs("Workspace", "no-such-workspace", workstationConsumer, fixtureStore());
+    expect(result).toEqual({ result: "NoMatch" });
+  });
+
+  it("(c') inert document with routes → NoMatch (an unresolvable document must not resolve; core §10.3's reading)", () => {
+    const doc: FabricDocument = {
+      ...docWithRoutes([
+        { match: { agentLocation: "cluster" }, type: "ssh", address: "workstation", path: "/data/repos" },
+      ]),
+      resolvable: false,
+      inertReasons: ["missing spec.owner"],
+    };
+    const result = resolveWs("Workspace", "custom", clusterConsumer, storeWithDoc(doc));
     expect(result).toEqual({ result: "NoMatch" });
   });
 

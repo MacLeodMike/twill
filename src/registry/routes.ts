@@ -86,10 +86,17 @@ export function route(store: RegistryStore, req: IncomingMessage, res: ServerRes
     respond(res, 200, store.health());
     return;
   }
-  // /Claim/<name>: the claim surface is T1-deferred for every method —
-  // no Claim document can exist in T1 (creation is 501), so a GET here
-  // can never legitimately succeed; 501 is the truthful answer.
-  if (first === "Claim" && second !== undefined && third === undefined) {
+  // /Claim/<name>: the claim surface is T1-deferred for the pinned claim
+  // methods (GET/POST/PATCH) — no Claim document can exist in T1 (creation
+  // is 501), so a GET here can never legitimately succeed; 501 is the
+  // truthful answer. Any other method falls through to the generic
+  // method-not-supported 404 below.
+  if (
+    first === "Claim" &&
+    second !== undefined &&
+    third === undefined &&
+    (method === "GET" || method === "POST" || method === "PATCH")
+  ) {
     respond(res, 501, CLAIMS_UNIMPLEMENTED);
     return;
   }
