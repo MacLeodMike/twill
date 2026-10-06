@@ -1,0 +1,252 @@
+// The `twill` CLI (Task 7) — the registry HTTP surface's first consumer.
+//
+// Four commands, hand-rolled arg parse (no dependency), fetch against the
+// registry base URL (flag --registry, env TWILL_REGISTRY, default
+// http://localhost:8080/twill/v1alpha1):
+//
+//   twill resolve <kind> <name> --principal P [--agent-location L] [--agent-kind K]
+//   twill list
+//   twill get <kind> <name>
+//   twill health
+//
+// Output pins: resolve prints the Attached descriptor as pretty JSON
+// (NoMatch/Unreachable print the word plainly); get/health print the
+// response body as pretty JSON; list prints a kind/name/resolvable/
+// durable_id table. Exit codes: Attached 0, NoMatch 2, Unreachable 3,
+// HTTP/transport/usage error 1.
+//
+// The CLI deliberately imports nothing from src/registry — it exercises
+// the same HTTP contract any consumer would.
+
+const DEFAULT_REGISTRY = "http://localhost:8080/twill/v1alpha1";
+const DEFAULT_AGENT_LOCATION = "workstation";
+const DEFAULT_AGENT_KIND = "twill-cli/0.1.0";
+
+const COMMANDS = ["resolve", "list", "get", "health"] as const;
+type Command = (typeof COMMANDS)[number];
+
+const FLAG_NAMES = ["--registry", "--agent-location", "--agent-kind", "--principal"] as const;
+
+type Parsed = {
+  command: Command;
+  positional: string[];
+  registry: string;
+  agentLocation: string;
+  agentKind: string;
+  principal: string | undefined;
+};
+
+/** Any invocation error that is the caller's fault: message on stderr, exit 1. */
+class UsageError extends Error {}
+
+const USAGE = `usage:
+  twill resolve <kind> <name> --principal <p> [--agent-location <l>] [--agent-kind <k>]
+  twill list
+  twill get <kind> <name>
+  twill health
+flags: --registry <url> (env TWILL_REGISTRY, default ${DEFAULT_REGISTRY})`;
+
+/** Parse argv (post-node, post-script). Throws UsageError on any malformation. */
+function parseArgs(argv: string[], env: NodeJS.ProcessEnv): Parsed {
+  const positional: string[] = [];
+  const flags = new Map<string, string>();
+  for (let i = 0; i < argv.length; i++) {
+    const token = argv[i]!;
+    if (token.startsWith("--")) {
+      const eq = token.indexOf("=");
+      const name = eq === -1 ? token : token.slice(0, eq);
+      if (!(FLAG_NAMES as readonly string[]).includes(name)) {
+        throw new UsageError(`unknown flag: ${name}`);
+      }
+      const value = eq === -1 ? argv[++i] : token.slice(eq + 1);
+      if (value === undefined) throw new UsageError(`flag ${name} requires a value`);
+      flags.set(name, value);
+    } else {
+      positional.push(token);
+    }
+  }
+
+  const command = positional.shift();
+  if (command === undefined || !(COMMANDS as readonly string[]).includes(command)) {
+    throw new UsageError(command === undefined ? "no command given" : `unknown command: ${command}`);
+  }
+
+  const registry = (flags.get("--registry") ?? env["TWILL_REGISTRY"] ?? DEFAULT_REGISTRY).replace(/\/+$/, "");
+  return {
+    command: command as Command,
+    positional,
+    registry,
+    agentLocation: flags.get("--agent-location") ?? DEFAULT_AGENT_LOCATION,
+    agentKind: flags.get("--agent-kind") ?? DEFAULT_AGENT_KIND,
+    principal: flags.get("--principal"),
+  };
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+/** Read a response body as JSON; undefined when the body isn't JSON. */
+async function readJson(res: Response): Promise<unknown> {
+  const text = await res.text();
+  try {
+    return JSON.parse(text) as unknown;
+  } catch {
+    return undefined;
+  }
+}
+
+/** Report a non-2xx registry answer; returns the HTTP-error exit code. */
+function httpError(status: number, body: unknown): number {
+  const detail =
+    isRecord(body) && typeof body["error"] === "string"
+      ? body["error"]
+      : body === undefined
+        ? "(no body)"
+        : JSON.stringify(body);
+  console.error(`twill: registry answered HTTP ${status}: ${detail}`);
+  return 1;
+}
+
+/** Positional arity check for the two-argument commands. */
+function requireKindName(p: Parsed): { kind: string; name: string } {
+  const [kind, name] = p.positional;
+  if (kind === undefined || name === undefined || p.positional.length !== 2) {
+    throw new UsageError(`${p.command} requires exactly <kind> and <name>`);
+  }
+  return { kind, name };
+}
+
+async function cmdResolve(p: Parsed): Promise<number> {
+  const { kind, name } = requireKindName(p);
+  if (p.principal === undefined) {
+    throw new UsageError("resolve requires --principal <principal> (e.g. user:you)");
+  }
+  const res = await fetch(`${p.registry}/resolve`, {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({
+      kind,
+      name,
+      consumer: { agentLocation: p.agentLocation, agentKind: p.agentKind, principal: p.principal },
+    }),
+  });
+  const body = await readJson(res);
+  if (!res.ok) return httpError(res.status, body);
+
+  if (!isRecord(body)) {
+    console.error(`twill: unexpected resolve response: ${JSON.stringify(body)}`);
+    return 1;
+  }
+  switch (body["result"]) {
+    case "Attached":
+      console.log(JSON.stringify(body["descriptor"] ?? null, null, 2));
+      return 0;
+    case "NoMatch":
+      console.log("NoMatch");
+      return 2;
+    case "Unreachable": {
+      console.log("Unreachable");
+      if (body["errors"] !== undefined) console.error(JSON.stringify(body["errors"], null, 2));
+      return 3;
+    }
+    default:
+      console.error(`twill: unexpected resolve response: ${JSON.stringify(body)}`);
+      return 1;
+  }
+}
+
+async function cmdList(p: Parsed): Promise<number> {
+  const res = await fetch(`${p.registry}/`);
+  const body = await readJson(res);
+  if (!res.ok) return httpError(res.status, body);
+  if (!Array.isArray(body)) {
+    console.error(`twill: unexpected discovery response: ${JSON.stringify(body)}`);
+    return 1;
+  }
+  printTable(body as Array<Record<string, unknown>>);
+  return 0;
+}
+
+async function cmdGet(p: Parsed): Promise<number> {
+  const { kind, name } = requireKindName(p);
+  const res = await fetch(`${p.registry}/${encodeURIComponent(kind)}/${encodeURIComponent(name)}`);
+  const body = await readJson(res);
+  if (!res.ok) return httpError(res.status, body);
+  console.log(JSON.stringify(body, null, 2));
+  return 0;
+}
+
+async function cmdHealth(p: Parsed): Promise<number> {
+  const res = await fetch(`${p.registry}/health`);
+  const body = await readJson(res);
+  if (!res.ok) return httpError(res.status, body);
+  console.log(JSON.stringify(body, null, 2));
+  return 0;
+}
+
+/** The discovery table: kind, name, resolvable, durable_id, padded to width. */
+function printTable(rows: Array<Record<string, unknown>>): void {
+  const columns = ["kind", "name", "resolvable", "durable_id"] as const;
+  const cell = (row: Record<string, unknown>, column: (typeof columns)[number]): string =>
+    String(row[column] ?? "");
+  const widths = columns.map((c) => Math.max(c.length, ...rows.map((r) => cell(r, c).length)));
+  const line = (values: string[]): string =>
+    values.map((v, i) => v.padEnd(widths[i] ?? 0)).join("  ").trimEnd();
+  console.log(line([...columns]));
+  for (const row of rows) console.log(line(columns.map((c) => cell(row, c))));
+}
+
+/** The whole invocation; returns the process exit code. */
+async function main(argv: string[], env: NodeJS.ProcessEnv): Promise<number> {
+  let parsed: Parsed;
+  try {
+    parsed = parseArgs(argv, env);
+  } catch (err) {
+    if (err instanceof UsageError) {
+      console.error(`${USAGE}\n\nerror: ${err.message}`);
+      return 1;
+    }
+    throw err;
+  }
+
+  try {
+    switch (parsed.command) {
+      case "resolve":
+        return await cmdResolve(parsed);
+      case "list":
+        return await cmdList(parsed);
+      case "get":
+        return await cmdGet(parsed);
+      case "health":
+        return await cmdHealth(parsed);
+    }
+  } catch (err) {
+    if (err instanceof UsageError) {
+      console.error(`${USAGE}\n\nerror: ${err.message}`);
+      return 1;
+    }
+    // Transport failure (connection refused, DNS, ...) — the registry is
+    // not answerable; that's an operational error, not a usage error.
+    console.error(`twill: ${err instanceof Error ? err.message : String(err)}`);
+    return 1;
+  }
+}
+
+// Run only when executed directly (not under import) — same guard as the
+// registry server entry.
+const isMain =
+  typeof process !== "undefined" &&
+  process.argv[1] !== undefined &&
+  (process.argv[1].endsWith("src/cli/twill.ts") || process.argv[1].endsWith("src/cli/twill.js"));
+if (isMain) {
+  main(process.argv.slice(2), process.env).then(
+    (code) => {
+      process.exitCode = code;
+    },
+    (err: unknown) => {
+      console.error(`twill: ${err instanceof Error ? err.message : String(err)}`);
+      process.exitCode = 1;
+    },
+  );
+}
