@@ -21,6 +21,7 @@ function fixtureStore(): ResolveStore {
     // not the store's; a stub that hides inert docs masks the guard.
     get: (kind, name) => documents.find((d) => d.kind === kind && d.name === name),
     statusCache: new Map(),
+    claims: () => documents.filter((d) => d.kind === "Claim"),
   };
 }
 
@@ -41,7 +42,7 @@ function docWithRoutes(routes: Route[]): FabricDocument {
 }
 
 function storeWithDoc(doc: FabricDocument): ResolveStore {
-  return { get: (_k, n) => (n === doc.name ? doc : undefined), statusCache: new Map() };
+  return { get: (_k, n) => (n === doc.name ? doc : undefined), statusCache: new Map(), claims: () => [] };
 }
 
 describe("resolve (core §7)", () => {
@@ -170,6 +171,7 @@ describe("resolve (core §7)", () => {
         documentKey(doc),
         { ready: false, provisionable: false, claimedBy: [], progress: "down", asOf: "2026-10-04T03:12:11Z", source: "cached" },
       ]]),
+      claims: () => [],
     };
     const result = resolveWs("Workspace", "custom", clusterConsumer, store);
     expect(result.result).toBe("Unreachable");

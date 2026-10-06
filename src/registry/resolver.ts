@@ -33,6 +33,8 @@ import { selectable, statusFor, type StatusCache, type StatusSurface } from "./s
 export interface ResolveStore {
   get(kind: Kind, name: string): FabricDocument | undefined;
   statusCache: StatusCache;
+  /** Merged-set Claim documents (latest-per-name) for §8.4 claimedBy derivation. */
+  claims(): FabricDocument[];
 }
 
 /** Workspace route-type enum (workspace spec §4) — T1's registered kind. */
@@ -66,7 +68,7 @@ export function resolve(kind: Kind, name: string, consumer: Consumer, store: Res
       errors.push({ route, reason: `unknown route type: ${String(route["type"])}` });
       continue;
     }
-    const st = statusFor(doc, store.statusCache);
+    const st = statusFor(doc, store.statusCache, store.claims());
     if (!selectable(st)) {
       errors.push({ route, reason: "not selectable: status reports neither ready nor provisionable" });
       continue;

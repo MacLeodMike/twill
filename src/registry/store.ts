@@ -140,6 +140,16 @@ export class RegistryStore {
     return this.snapshot.byName.get(`${kind}/${name}`);
   }
 
+  /**
+   * The Claim documents of the current (merged, latest-per-name) snapshot —
+   * the set `claimedBy` derives from (core §8.4/§9). Read at status time:
+   * a claim append or release is visible on the very next statusFor call.
+   * A fresh array each call; callers must not mutate the elements.
+   */
+  claims(): FabricDocument[] {
+    return this.snapshot.documents.filter((d) => d.kind === "Claim");
+  }
+
   health(): HealthReport {
     const { documentSet, rejectedAt, reason } = this.report;
     const health: HealthReport = { documentSet, warnings: [...this.warnings] };

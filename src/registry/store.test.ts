@@ -109,7 +109,11 @@ const consumer: Consumer = { agentLocation: "workstation", agentKind: "pi", prin
 
 /** A ResolveStore view over a held snapshot (Review Focus #4). */
 function snapshotStore(snap: Snapshot, statusCache: ResolveStore["statusCache"]): ResolveStore {
-  return { get: (kind, name) => snap.byName.get(`${kind}/${name}`), statusCache };
+  return {
+    get: (kind, name) => snap.byName.get(`${kind}/${name}`),
+    statusCache,
+    claims: () => snap.documents.filter((d) => d.kind === "Claim"),
+  };
 }
 
 describe("RegistryStore", () => {
