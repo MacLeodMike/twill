@@ -2,7 +2,9 @@ services:
   twill-registry:
     build: ..
     volumes:
-      - ../fixtures/documents:/documents:ro
+      # rw, not ro: the registry persists the claims overlay
+      # (.twill-overlay.jsonl) beside the watched documents (T2a).
+      - ../fixtures/documents:/documents:rw
     ports:
       - "8080:8080"
     restart: unless-stopped

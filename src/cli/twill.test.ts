@@ -8,6 +8,11 @@
 // storage fingerprints, so the boot applies the same one-line mutation as
 // the Task 5/6 harnesses before start(). tsx cold-start is slow; every
 // test gets a generous timeout.
+//
+// The claims block (T2a Task 6) runs serially in a fixed order (a)–(d):
+// one claim is created, listed, released, and verified absent — the claim
+// name is threaded through the block's outer scope because each step's
+// assertions depend on the previous step's server-side state.
 
 import { describe, it, expect, beforeAll, afterAll } from "vitest";
 import { execFile } from "node:child_process";
@@ -105,6 +110,99 @@ describe("twill CLI", () => {
       const r = await runCli(["resolve", "Workspace", "no-such-workspace", "--principal", "user:test"]);
       expect(r.code).toBe(2);
       expect(r.stdout.trim()).toBe("NoMatch");
+    },
+    SPAWN_TIMEOUT_MS,
+  );
+});
+
+describe("twill CLI — claims (T2a Task 6)", () => {
+  // Serial block: (a) create → (b) list → (c) release → (d) absent.
+  let claimName = "";
+
+  it(
+    "(a) claim create exits 0 and prints the created claim as JSON",
+    async () => {
+      const r = await runCli([
+        "claim",
+        "create",
+        "Workspace",
+        "payments-repo",
+        "--principal",
+        "user:cli-test",
+        "--route",
+        JSON.stringify({ type: "local", path: "~/repos/payments-repo" }),
+        "--param",
+        "branch=feat-cli",
+      ]);
+      expect(r.code).toBe(0);
+      const created = JSON.parse(r.stdout) as {
+        kind?: string;
+        metadata?: { name?: string };
+        spec?: {
+          owner?: string;
+          parent?: { kind?: string; name?: string };
+          claim?: {
+            id?: string;
+            principal?: string;
+            released?: boolean;
+            parameters?: Record<string, string>;
+            claimedOn?: { durable_id?: string; fingerprint?: string };
+          };
+        };
+      };
+      expect(created.kind).toBe("Claim");
+      claimName = created.metadata?.name ?? "";
+      expect(claimName).toMatch(/^claim-payments-repo-user-cli-test-\d+$/);
+      expect(created.spec?.owner).toBe("user:cli-test");
+      expect(created.spec?.parent).toEqual({ kind: "Workspace", name: "payments-repo" });
+      // The CLI computed claimedOn from the parent document (the harness
+      // re-fingerprints payments-repo to vol-payments-01 at boot).
+      expect(created.spec?.claim?.claimedOn).toEqual({
+        durable_id: "ws_01J8Z4-payments-repo",
+        fingerprint: "vol-payments-01",
+      });
+      expect(created.spec?.claim?.released).toBe(false);
+      expect(created.spec?.claim?.parameters).toEqual({ branch: "feat-cli" });
+    },
+    SPAWN_TIMEOUT_MS,
+  );
+
+  it(
+    "(b) claims Workspace payments-repo lists the created claim",
+    async () => {
+      expect(claimName).not.toBe("");
+      const r = await runCli(["claims", "Workspace", "payments-repo"]);
+      expect(r.code).toBe(0);
+      expect(r.stdout).toContain(claimName);
+      expect(r.stdout).toContain("user:cli-test");
+      expect(r.stdout).toContain("ws_01J8Z4-payments-repo");
+    },
+    SPAWN_TIMEOUT_MS,
+  );
+
+  it(
+    "(c) claim release exits 0 and prints the released claim",
+    async () => {
+      expect(claimName).not.toBe("");
+      const r = await runCli(["claim", "release", "Workspace", "payments-repo", claimName]);
+      expect(r.code).toBe(0);
+      const released = JSON.parse(r.stdout) as {
+        metadata?: { name?: string };
+        spec?: { claim?: { released?: boolean } };
+      };
+      expect(released.metadata?.name).toBe(claimName);
+      expect(released.spec?.claim?.released).toBe(true);
+    },
+    SPAWN_TIMEOUT_MS,
+  );
+
+  it(
+    "(d) the released claim is absent from the default claims listing",
+    async () => {
+      expect(claimName).not.toBe("");
+      const r = await runCli(["claims", "Workspace", "payments-repo"]);
+      expect(r.code).toBe(0);
+      expect(r.stdout).not.toContain(claimName);
     },
     SPAWN_TIMEOUT_MS,
   );
