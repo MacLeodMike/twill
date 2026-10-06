@@ -29,7 +29,7 @@ import { join } from "node:path";
 import { KINDS, type FabricDocument, type Kind } from "./document.js";
 import { loadDirectory, type LoadProblem } from "./loader.js";
 import { documentKey, rejectCheck } from "./lineage.js";
-import { OverlayStore, OVERLAY_FILENAME, type Warning } from "./overlay.js";
+import { OverlayStore, OVERLAY_FILENAME, type Warning as OverlayWarning } from "./overlay.js";
 import type { StatusCache } from "./status.js";
 
 /** An immutable view of the document set; the consistency unit for readers. */
@@ -39,9 +39,16 @@ export type Snapshot = {
   generation: number;
 };
 
-// The `Warning` union (overlay-shadow / overlay-corrupt-line) lives in
-// overlay.ts — both variants are overlay-sourced.
-export type { Warning } from "./overlay.js";
+/**
+ * Registry health warnings (workspace §8's `warnings` array): the
+ * overlay-sourced variants (overlay.ts: corrupt line, shadowed watched
+ * document) plus the store-sourced orphan-claim variant (core §8.3 — a
+ * Claim whose `spec.parent` does not resolve in the merged set is marked
+ * inert and reported, never a set-level rejection).
+ */
+export type Warning =
+  | OverlayWarning
+  | { type: "orphan-claim"; claim: string; parent: string };
 
 export type HealthReport = {
   documentSet: "current" | "stale";
@@ -89,7 +96,7 @@ export class RegistryStore {
   private readonly overlayStore: OverlayStore;
 
   /** Corrupt-line warnings from the start-time overlay read (persist for the store's run). */
-  private readonly overlayLoadWarnings: Warning[];
+  private readonly overlayLoadWarnings: OverlayWarning[];
 
   /**
    * The watched documents of the last accepted (re)load — needed for the
@@ -164,7 +171,9 @@ export class RegistryStore {
    * Reload now (the initial load and the debounced watcher callback both
    * run through here). On reject the last-good snapshot stays and health
    * turns stale; on accept a fully-built snapshot replaces the old one in a
-   * single assignment and the generation increments.
+   * single assignment and the generation increments. Orphan claims (core
+   * §8.3) are marked inert and reported in health warnings on every
+   * accepted load — never a set-level rejection.
    */
   reload(): void {
     if (this.closed) return;
@@ -190,10 +199,13 @@ export class RegistryStore {
       return;
     }
 
+    // Orphan claims (§8.3): mark inert + health warnings, never a rejection.
+    const { documents: orphanMarked, warnings: orphanWarnings } = markOrphanClaims(merged);
+
     // The snapshot is the atomicity unit: built fully, then a single swap.
     this.watched = documents;
-    this.snapshot = buildSnapshot(merged, this.snapshot.generation + 1);
-    this.warnings = [...this.overlayLoadWarnings, ...shadowWarnings(documents, this.overlay)];
+    this.snapshot = buildSnapshot(orphanMarked, this.snapshot.generation + 1);
+    this.warnings = [...this.overlayLoadWarnings, ...shadowWarnings(documents, this.overlay), ...orphanWarnings];
     this.report = { documentSet: "current" };
   }
 
@@ -217,8 +229,9 @@ export class RegistryStore {
     }
     this.overlayStore.append(doc);
     this.overlay.set(documentKey(doc), doc);
-    this.snapshot = buildSnapshot(merged, this.snapshot.generation + 1);
-    this.warnings = [...this.overlayLoadWarnings, ...shadowWarnings(this.watched, this.overlay)];
+    const { documents: orphanMarked, warnings: orphanWarnings } = markOrphanClaims(merged);
+    this.snapshot = buildSnapshot(orphanMarked, this.snapshot.generation + 1);
+    this.warnings = [...this.overlayLoadWarnings, ...shadowWarnings(this.watched, this.overlay), ...orphanWarnings];
     return { ok: true };
   }
 
@@ -308,6 +321,31 @@ function shadowWarnings(
     if (watchedKeys.has(key)) warnings.push({ type: "overlay-shadow", name: key });
   }
   return warnings;
+}
+
+/**
+ * The orphan-claim pass (core §8.3): every Claim in the merged set whose
+ * `spec.parent` reference does not resolve is marked inert (a new
+ * `resolvable: false` copy carrying an `orphan claim` reason) and reported
+ * in health warnings — never a set-level rejection. Orphan claims still
+ * derive `claimedBy` (claimedOn is self-contained, status.ts) and still
+ * appear in the claims read-path, marked inert in their serialized form.
+ */
+function markOrphanClaims(documents: FabricDocument[]): { documents: FabricDocument[]; warnings: Warning[] } {
+  const present = new Set(documents.map(documentKey));
+  const warnings: Warning[] = [];
+  const marked = documents.map((doc) => {
+    if (doc.kind !== "Claim" || doc.parent === undefined) return doc;
+    const parentKey = `${doc.parent.kind}/${doc.parent.name}`;
+    if (present.has(parentKey)) return doc;
+    warnings.push({ type: "orphan-claim", claim: doc.name, parent: parentKey });
+    return {
+      ...doc,
+      resolvable: false,
+      inertReasons: [...doc.inertReasons, `orphan claim: parent ${parentKey} is not in the document set (§8.3)`],
+    };
+  });
+  return { documents: marked, warnings };
 }
 
 /** A snapshot over a merged document list (union already computed). */

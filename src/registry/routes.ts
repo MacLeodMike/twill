@@ -4,9 +4,7 @@
 // from RegistryStore (Task 5) and resolve (Task 4).
 //
 // All routes live under /twill/v1alpha1. Kinds are capitalized in URLs
-// (`/twill/v1alpha1/Workspace/<name>`). Unknown paths → 404. Claims
-// create/read and the writable overlay are T1-deferred and answer 501
-// with an explicit error body (Global Constraints / workspace §8).
+// (`/twill/v1alpha1/Workspace/<name>`). Unknown paths → 404.
 
 import type { IncomingMessage, ServerResponse } from "node:http";
 import { KINDS, durableIdOf, isRecord, type FabricDocument, type Kind } from "./document.js";
@@ -22,12 +20,12 @@ export type RouteError = { httpStatus: 400 | 404; error: string };
 export type HttpStatus =
   | 200 // success (incl. claim release + idempotent re-release, T2a)
   | 201 // claim created (T2a)
-  | 400 // malformed body / missing or ill-typed fields
-  | 404 // unknown path or absent document (PATCH on a missing claim, T2a)
+  | 400 // malformed body / missing or ill-typed fields (incl. GET /claims without `parent`)
+  | 404 // unknown path or absent document (PATCH on a missing claim, T2a; POST /claims plural)
   | 409 // claim conflicts: existing Claim name, missing parent, PATCH mutating beyond release (T2a)
   | 422 // claimedOn inconsistent with the parent document (T2a, §8.4)
   | 500 // internal fault (e.g. the overlay write failing — readJsonBody's last-resort guard)
-  | 501; // T1-deferred surface (claim GET paths, overlay)
+  | 501; // T1-deferred surface (GET /Claim/<name>; the overlay PATCH)
 
 /** The T1-deferred bodies (Global Constraints + workspace §8). */
 export const CLAIMS_UNIMPLEMENTED = {
@@ -42,14 +40,18 @@ export const OVERLAY_UNIMPLEMENTED = {
 export const API_PREFIX = "/twill/v1alpha1";
 
 /**
- * Dispatch one request against `store`. `req.url` is the request path
- * (query string ignored — T1 has no query-parameter surface that works:
- * `/claims` is 501 and the rest is queryless). Never throws itself; body-
- * handling failures are answered as JSON by readJsonBody's last-resort
- * 500 guard (server.ts's try/catch cannot contain async body callbacks).
+ * Dispatch one request against `store`. `req.url` carries the query string;
+ * the path alone drives dispatch, and the one query-parameter surface —
+ * GET /claims?parent=<kind>/<name>&includeReleased=<bool> (T2a Task 5) —
+ * parses its parameters from the URL. Never throws itself; body-handling
+ * failures are answered as JSON by readJsonBody's last-resort 500 guard
+ * (server.ts's try/catch cannot contain async body callbacks).
  */
 export function route(store: RegistryStore, req: IncomingMessage, res: ServerResponse): void {
-  const path = (req.url ?? "").split("?")[0] ?? "";
+  const rawUrl = req.url ?? "";
+  const qIndex = rawUrl.indexOf("?");
+  const path = qIndex === -1 ? rawUrl : rawUrl.slice(0, qIndex);
+  const query = qIndex === -1 ? new URLSearchParams() : new URLSearchParams(rawUrl.slice(qIndex + 1));
   const method = req.method ?? "GET";
 
   if (!path.startsWith(`${API_PREFIX}/`) && path !== API_PREFIX) {
@@ -71,10 +73,21 @@ export function route(store: RegistryStore, req: IncomingMessage, res: ServerRes
 
   const [first, second, third] = segments as [string, string | undefined, string | undefined];
 
-  // 501 surface first: the claims trio and overlay PATCH are T1-deferred
-  // regardless of what the rest of the path says.
-  if (first === "claims" && segments.length === 1 && (method === "GET" || method === "POST")) {
-    respond(res, 501, CLAIMS_UNIMPLEMENTED);
+  // GET /claims?parent=<kind>/<name> (T2a Task 5): the provider read-path —
+  // every claim against the parent, un-released only by default. The T1 501
+  // is removed; POST /claims (plural) was never a real endpoint (creates go
+  // to POST /Claim/<name>) and falls through to 404 like any unknown path.
+  if (first === "claims" && segments.length === 1) {
+    if (method === "GET") {
+      const checked = claimsQuery(store, query);
+      if ("error" in checked) {
+        respond(res, checked.httpStatus, { error: checked.error });
+        return;
+      }
+      respond(res, 200, checked.claims);
+      return;
+    }
+    respond(res, 404, { error: `unknown path: ${path}` });
     return;
   }
   if (first === "resolve" && segments.length === 1 && method === "POST") {
@@ -94,8 +107,9 @@ export function route(store: RegistryStore, req: IncomingMessage, res: ServerRes
   }
   // /Claim/<name>: POST creates the claim, PATCH releases it (T2a Tasks
   // 1+2 — release is the only permitted mutation, workspace §8). GET stays
-  // T1-deferred (GET /claims lands in Task 5). Any other method falls
-  // through to the generic method-not-supported 404 below.
+  // T1-deferred (single-claim GET is not part of v1alpha1's surface). Any
+  // other method falls through to the generic method-not-supported 404
+  // below.
   if (first === "Claim" && second !== undefined && third === undefined) {
     if (method === "POST") {
       readJsonBody(req, res, (body) => {
@@ -351,4 +365,41 @@ function respond(res: ServerResponse, status: HttpStatus, body: unknown): void {
   const payload = JSON.stringify(body);
   res.writeHead(status, { "content-type": "application/json", "content-length": Buffer.byteLength(payload) });
   res.end(payload);
+}
+
+/**
+ * The provider claims read-path (workspace §8): every claim document whose
+ * `spec.parent` matches the kind-qualified `parent` query parameter,
+ * un-released only unless `includeReleased=true`. The parameter is
+ * required — a bare GET /claims is a 400 naming it. A parent that never
+ * existed (or is currently orphan-deleted) is not an error: providers poll
+ * for parents that may not be registered yet, so the answer is 200 with an
+ * empty array. Claim envelopes are served verbatim from `doc.raw`, with
+ * `status.inert` stamped true on orphan claims (parent unresolvable) —
+ * the inert marking is derived store-side and stamps only status, which
+ * readers ignore.
+ */
+function claimsQuery(
+  store: RegistryStore,
+  query: URLSearchParams,
+): { claims: Array<Record<string, unknown>> } | RouteError {
+  const parent = query.get("parent");
+  if (parent === null || parent === "") {
+    return {
+      httpStatus: 400,
+      error: "the 'parent' query parameter is required (GET /claims?parent=<kind>/<name>)",
+    };
+  }
+  const includeReleased = query.get("includeReleased") === "true";
+  const claims: Array<Record<string, unknown>> = [];
+  for (const doc of store.claims()) {
+    if (doc.parent === undefined || `${doc.parent.kind}/${doc.parent.name}` !== parent) continue;
+    if (!includeReleased && doc.kindSpec["released"] === true) continue;
+    const raw = isRecord(doc.raw) ? { ...doc.raw } : {};
+    const status = isRecord(raw["status"]) ? { ...raw["status"] } : {};
+    if (!doc.resolvable) status["inert"] = true;
+    raw["status"] = status;
+    claims.push(raw);
+  }
+  return { claims };
 }

@@ -287,7 +287,7 @@ describe("(f) POST statusReport then resolve — the descriptor reflects the rep
   });
 });
 
-describe("(g) claims surface — POST creates + PATCH releases (T2a); the claim GETs keep the T1 501", () => {
+describe("(g) claims surface — POST creates + PATCH releases (T2a); the single-claim GET keeps the T1 501", () => {
   it("POST /Claim/<name> → 400 on a malformed body (shape checks precede parent lookup; the full create contract lives in claims.test.ts)", async () => {
     const { base } = await boot();
     const res = await post(base, "/Claim/x", { spec: { claim: { principal: "user:test" } } });
@@ -306,18 +306,30 @@ describe("(g) claims surface — POST creates + PATCH releases (T2a); the claim 
     expect(((await res.json()) as { error: string }).error).toContain("Claim/x");
   });
 
-  it("GET /Claim/<name> → the same 501 (no claim can exist in T1; a GET can never succeed)", async () => {
+  it("GET /Claim/<name> → the same 501 (single-claim GET is not part of v1alpha1's surface)", async () => {
     const { base } = await boot();
     const res = await fetch(`${base}/Claim/x`);
     expect(res.status).toBe(501);
     expect(await res.json()).toEqual({ error: "claims unimplemented in T1 milestone", milestone: "T2" });
   });
 
-  it("GET /claims?parent=... → the same 501 (query ignored)", async () => {
+  it("GET /claims without ?parent → 400 naming the parameter (Task 5 read-path)", async () => {
     const { base } = await boot();
-    const res = await fetch(`${base}/claims?parent=Workspace/workstation-repos`);
-    expect(res.status).toBe(501);
-    expect(await res.json()).toEqual({ error: "claims unimplemented in T1 milestone", milestone: "T2" });
+    const res = await fetch(`${base}/claims`);
+    expect(res.status).toBe(400);
+    const json = (await res.json()) as { error: string };
+    expect(json.error).toContain("parent");
+  });
+
+  it("POST /claims (plural) → 404 (never a real endpoint — creates go to POST /Claim/<name>)", async () => {
+    const { base } = await boot();
+    const res = await fetch(`${base}/claims`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({}),
+    });
+    expect(res.status).toBe(404);
+    expect(((await res.json()) as { error: string }).error).toContain("unknown path");
   });
 
   it("DELETE /Claim/<name> → 404 (the 501 is method-scoped; other methods fall through)", async () => {

@@ -483,14 +483,231 @@ describe("validateClaimRelease — unit-level pins", () => {
   });
 });
 
-describe("claim surface — GET paths still 501 in Task 2", () => {
-  it("GET /Claim/<name> and GET /claims keep the T1 501", async () => {
+describe("GET /claims?parent=<kind>/<name> — the provider claims read-path (Task 5)", () => {
+  it("(a) claims against payments-repo → 200 with the claim (verbatim envelope); an unrelated parent's claim is not listed", async () => {
+    const { base } = await boot();
+    const created = await postClaim(base, "claim-rp-a", validClaimBody("claim-rp-a"));
+    expect(created.status).toBe(201);
+
+    // A second claim against workstation-repos must not leak into the
+    // payments-repo answer (claimedOn re-pointed at that parent — storage
+    // fingerprint included, §8.4).
+    const other = validClaimBody("claim-rp-other") as { spec: { claim: Record<string, unknown>; parent: Record<string, string> } };
+    other.spec.claim.claimedOn = { fingerprint: "vol-2c4f1a", durable_id: "ws_01J8Z4-workstation-repos" };
+    other.spec.parent = { kind: "Workspace", name: "workstation-repos" };
+    const second = await postClaim(base, "claim-rp-other", other);
+    expect(second.status).toBe(201);
+
+    const res = await fetch(`${base}/claims?parent=${encodeURIComponent("Workspace/payments-repo")}`);
+    expect(res.status).toBe(200);
+    const claims = (await res.json()) as Array<{
+      kind: string;
+      metadata: { name: string };
+      spec: { parent: { kind: string; name: string }; claim: Record<string, unknown> };
+      status: Record<string, unknown>;
+    }>;
+    expect(claims).toHaveLength(1);
+    const claim = claims[0]!;
+    // Verbatim envelope: the served object is the stored raw document.
+    expect(claim.kind).toBe("Claim");
+    expect(claim.metadata.name).toBe("claim-rp-a");
+    expect(claim.spec.parent).toEqual({ kind: "Workspace", name: "payments-repo" });
+    expect(claim.spec.claim.id).toBe("cl_test-claim-rp-a");
+    expect(claim.spec.claim.released).toBe(false);
+    // Non-orphan claims carry no inert stamp.
+    expect(claim.status["inert"]).toBeUndefined();
+  });
+
+  it("(b) no parent param → 400 naming it; parent present but empty → 400", async () => {
+    const { base } = await boot();
+    const missing = await fetch(`${base}/claims`);
+    expect(missing.status).toBe(400);
+    expect(((await missing.json()) as { error: string }).error).toContain("parent");
+
+    const empty = await fetch(`${base}/claims?parent=`);
+    expect(empty.status).toBe(400);
+    expect(((await empty.json()) as { error: string }).error).toContain("parent");
+  });
+
+  it("(c) parent that never existed → 200 [] (providers poll for parents that may not be registered yet)", async () => {
+    const { base } = await boot();
+    const res = await fetch(`${base}/claims?parent=${encodeURIComponent("Workspace/no-such-workspace")}`);
+    expect(res.status).toBe(200);
+    expect(await res.json()).toEqual([]);
+  });
+
+  it("(d) parent file deleted → reload → claim still listed (marked inert) + health carries the orphan entry; claimedBy still derives (Task 4 un-regressed)", async () => {
+    const dir = tempDocuments(tempBaseline);
+    const store = startStore(dir);
+    const server = createServer(store);
+    openServers.push(server);
+    await new Promise<void>((done) => server.listen(0, "127.0.0.1", () => done()));
+    const address = server.address();
+    const port = typeof address === "object" && address !== null ? address.port : 0;
+    const base = `http://127.0.0.1:${port}/twill/v1alpha1`;
+
+    // tempBaseline de-aliases payments-repo: fingerprint vol-payments-01, no
+    // parent. A sibling sharing the claimed storage fingerprint lets the
+    // claimedBy regression guard observe the claim after the parent is gone.
+    writeFileSync(
+      join(dir, "Workspace", "payments-sibling.yaml"),
+      `apiVersion: twill.bitwiseoperations.ca/v1alpha1
+kind: Workspace
+metadata: { name: payments-sibling }
+spec:
+  owner: user:test
+  routes:
+    - match: {agentLocation: workstation}
+      type: local
+      path: ~/repos/payments-sibling
+  workspace:
+    storageBacked: true
+    accessMode: RWO
+    storage: { id: ws-payments-sibling, fingerprint: vol-payments-01 }
+status: {}
+`,
+    );
+    store.reload();
+
+    const created = await postClaim(
+      base,
+      "claim-rp-orphan",
+      validClaimBody("claim-rp-orphan", { fingerprint: "vol-payments-01" }),
+    );
+    expect(created.status).toBe(201);
+    expect(store.health().warnings).toEqual([]);
+
+    // The parent is deleted after the claim exists — §8.3's orphan case:
+    // inert + health warning, never a set-level rejection.
+    rmSync(join(dir, "Workspace", "payments-repo.yaml"));
+    store.reload();
+    expect(store.get("Workspace", "payments-repo")).toBeUndefined();
+    expect(store.health().documentSet).toBe("current");
+
+    // The claim is still served against the parent's name (orphan claims
+    // are listed), marked inert in its serialized form.
+    const res = await fetch(`${base}/claims?parent=${encodeURIComponent("Workspace/payments-repo")}`);
+    expect(res.status).toBe(200);
+    const claims = (await res.json()) as Array<{ metadata: { name: string }; status: Record<string, unknown> }>;
+    expect(claims).toHaveLength(1);
+    expect(claims[0]!.metadata.name).toBe("claim-rp-orphan");
+    expect(claims[0]!.status["inert"]).toBe(true);
+
+    // Store-level marking: the claim document itself is inert with a reason
+    // naming the orphan parent.
+    const stored = store.get("Claim", "claim-rp-orphan");
+    expect(stored?.resolvable).toBe(false);
+    expect(stored?.inertReasons.some((r) => r.includes("Workspace/payments-repo"))).toBe(true);
+
+    // Health warnings carry the §8.3 orphan entry.
+    expect(store.health().warnings).toContainEqual({
+      type: "orphan-claim",
+      claim: "claim-rp-orphan",
+      parent: "Workspace/payments-repo",
+    });
+    const health = await (await fetch(`${base}/health`)).json() as { documentSet: string; warnings: unknown[] };
+    expect(health.documentSet).toBe("current");
+    expect(health.warnings).toContainEqual({
+      type: "orphan-claim",
+      claim: "claim-rp-orphan",
+      parent: "Workspace/payments-repo",
+    });
+
+    // Task 4 regression guard: the orphan claim still derives claimedBy —
+    // claimedOn is self-contained, so a sibling still sharing the claimed
+    // storage fingerprint reports the claim.
+    const statusRes = await fetch(`${base}/resolve`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({
+        kind: "Workspace",
+        name: "payments-sibling",
+        consumer: { agentLocation: "workstation", agentKind: "pi", principal: "user:example" },
+      }),
+    });
+    const resolved = (await statusRes.json()) as {
+      descriptor?: { status: { claimedBy: Array<Record<string, unknown>> } };
+    };
+    expect(resolved.descriptor?.status.claimedBy).toContainEqual({
+      name: "claim-rp-orphan",
+      owner: "user:example",
+      principal: "pi/0.99.1@workstation",
+      claimedOn: { fingerprint: "vol-payments-01", durable_id: "ws_01J8Z4-payments-repo" },
+    });
+  });
+
+  it("(d') orphanhood clears when the parent is re-registered (recomputed on reload, both ways)", async () => {
+    const dir = tempDocuments(tempBaseline);
+    const store = startStore(dir);
+
+    const checked = validateClaimCreate(
+      validClaimBody("claim-rp-restore", { fingerprint: "vol-payments-01" }),
+      "claim-rp-restore",
+      store,
+    );
+    expect(checked.ok).toBe(true);
+    if (!checked.ok) return;
+    expect(store.appendOverlay(checked.doc)).toEqual({ ok: true });
+
+    rmSync(join(dir, "Workspace", "payments-repo.yaml"));
+    store.reload();
+    expect(store.health().warnings).toContainEqual({
+      type: "orphan-claim",
+      claim: "claim-rp-restore",
+      parent: "Workspace/payments-repo",
+    });
+    expect(store.get("Claim", "claim-rp-restore")?.resolvable).toBe(false);
+
+    // The parent comes back (Flux re-sync / operator restore): the next
+    // accepted load recomputes — the claim is resolvable again and the
+    // warning is gone.
+    cpSync(join(fixtures, "Workspace", "payments-repo.yaml"), join(dir, "Workspace", "payments-repo.yaml"));
+    store.reload();
+    expect(store.health()).toEqual({ documentSet: "current", warnings: [] });
+    expect(store.get("Claim", "claim-rp-restore")?.resolvable).toBe(true);
+  });
+
+  it("(e) includeReleased=false (default) filters released claims; includeReleased=true lists them", async () => {
+    const { base, store } = await boot();
+    const created = await postClaim(base, "claim-rp-rel", validClaimBody("claim-rp-rel"));
+    expect(created.status).toBe(201);
+    const released = await patchClaim(base, "claim-rp-rel", releaseBody("claim-rp-rel"));
+    expect(released.status).toBe(200);
+    expect(store.get("Claim", "claim-rp-rel")?.kindSpec["released"]).toBe(true);
+
+    // Default: un-released only — the released claim is filtered out.
+    const def = await fetch(`${base}/claims?parent=${encodeURIComponent("Workspace/payments-repo")}`);
+    expect(def.status).toBe(200);
+    expect(await def.json()).toEqual([]);
+
+    // Opt in: the released claim is listed, envelope verbatim.
+    const all = await fetch(
+      `${base}/claims?parent=${encodeURIComponent("Workspace/payments-repo")}&includeReleased=true`,
+    );
+    expect(all.status).toBe(200);
+    const claims = (await all.json()) as Array<{ metadata: { name: string }; spec: { claim: Record<string, unknown> } }>;
+    expect(claims).toHaveLength(1);
+    expect(claims[0]!.metadata.name).toBe("claim-rp-rel");
+    expect(claims[0]!.spec.claim.released).toBe(true);
+
+    // Any value other than the literal "true" keeps the default filter.
+    const sloppy = await fetch(
+      `${base}/claims?parent=${encodeURIComponent("Workspace/payments-repo")}&includeReleased=1`,
+    );
+    expect(sloppy.status).toBe(200);
+    expect(await sloppy.json()).toEqual([]);
+  });
+});
+
+describe("claim surface — the single-claim GET stays 501 (Task 5 removed the /claims 501)", () => {
+  it("GET /Claim/<name> keeps the T1 501; GET /claims answers 200/400 per its own contract", async () => {
     const { base } = await boot();
     const getOne = await fetch(`${base}/Claim/x`);
     expect(getOne.status).toBe(501);
     expect(await getOne.json()).toEqual({ error: "claims unimplemented in T1 milestone", milestone: "T2" });
 
     const getClaims = await fetch(`${base}/claims?parent=Workspace/payments-repo`);
-    expect(getClaims.status).toBe(501);
+    expect(getClaims.status).toBe(200);
+    expect(await getClaims.json()).toEqual([]);
   });
 });
