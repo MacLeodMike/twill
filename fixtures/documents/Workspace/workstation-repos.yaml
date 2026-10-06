@@ -1,0 +1,23 @@
+apiVersion: twill.bitwiseoperations.ca/v1alpha1
+kind: Workspace
+metadata: { name: workstation-repos, labels: { twill/workspace-class: git } }
+spec:
+  owner: user:example
+  routes:
+    - match: {agentLocation: workstation}
+      type: local
+      path: ~/repos
+    - match: {agentLocation: cluster}
+      type: ssh
+      address: workstation
+      path: /data/repos
+  workspace:
+    storageBacked: true
+    accessMode: RWO
+    storage:
+      id: ws_01J8Z4-workstation-repos
+      fingerprint: vol-2c4f1a
+    hostname: workstation
+    toolHints: [git, forgejo-api, pi]
+    shellPolicy: full
+status: {}
