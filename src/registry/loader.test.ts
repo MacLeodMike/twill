@@ -105,6 +105,23 @@ describe("loadDirectory", () => {
     }
   });
 
+  it("dot-prefixed entries are skipped silently (registry-private files like the overlay JSONL are never documents, never problems)", () => {
+    const dir = tempDocuments();
+    try {
+      write(dir, "Workspace/alpha.yaml", workspaceYaml("alpha", "ws_alpha"));
+      // The T2a overlay file lives at <documentsDir>/.twill-overlay.jsonl.
+      writeFileSync(join(dir, ".twill-overlay.jsonl"), '{"kind":"Claim"}\n');
+      // Dotfiles inside kind dirs are skipped the same way.
+      writeFileSync(join(dir, "Workspace", ".hidden.yaml"), workspaceYaml("hidden", "ws_hidden"));
+
+      const { documents, problems } = loadDirectory(dir);
+      expect(documents.map((d) => d.name)).toEqual(["alpha"]);
+      expect(problems).toEqual([]);
+    } finally {
+      cleanup(dir);
+    }
+  });
+
   it("wrong apiVersion, missing owner, or unregistered kind loads inert with the reason noted", () => {
     const dir = tempDocuments();
     try {

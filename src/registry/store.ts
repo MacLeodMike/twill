@@ -15,8 +15,9 @@
 // (watched ∪ overlay ∪ new) with rejectCheck *before* writing, so one bad
 // write cannot poison every subsequent reload. The merged snapshot is the
 // union with the overlay winning on name collision (§8.3's document set
-// means the union). File persistence lands in Task 3 behind this same
-// seam; the merge semantics here are already the final ones.
+// means the union). The overlay is persisted (Task 3) as a JSONL file at
+// `<documentsDir>/.twill-overlay.jsonl` behind OverlayStore: read once at
+// start, appended synchronously on every accepted `appendOverlay`.
 //
 // RegistryStore satisfies the resolver's ResolveStore interface:
 // `get(kind, name)` answers from the current snapshot and `statusCache` is
@@ -28,6 +29,7 @@ import { join } from "node:path";
 import { KINDS, type FabricDocument, type Kind } from "./document.js";
 import { loadDirectory, type LoadProblem } from "./loader.js";
 import { documentKey, rejectCheck } from "./lineage.js";
+import { OverlayStore, OVERLAY_FILENAME, type Warning } from "./overlay.js";
 import type { StatusCache } from "./status.js";
 
 /** An immutable view of the document set; the consistency unit for readers. */
@@ -37,8 +39,9 @@ export type Snapshot = {
   generation: number;
 };
 
-/** Non-fingerprint registry warnings (empty in T1 — claims are 501). */
-export type Warning = { message: string };
+// The `Warning` union (overlay-shadow / overlay-corrupt-line) lives in
+// overlay.ts — both variants are overlay-sourced.
+export type { Warning } from "./overlay.js";
 
 export type HealthReport = {
   documentSet: "current" | "stale";
@@ -46,6 +49,9 @@ export type HealthReport = {
   reason?: string;
   warnings: Warning[];
 };
+
+/** The current/stale half of the health report (warnings live separately). */
+type ServedHealth = { documentSet: "current" | "stale"; rejectedAt?: string; reason?: string };
 
 /** The watched source is read-only: reloads replace in-memory state only. */
 const RELOAD_DEBOUNCE_MS = 100;
@@ -58,8 +64,8 @@ export class RegistryStore {
   /** The current (accepted, or empty-on-cold-reject) snapshot. */
   private snapshot: Snapshot;
 
-  /** Health over the last accepted (or cold-start) set. */
-  private report: HealthReport;
+  /** Health over the last accepted (or cold-start) set; warnings live in `this.warnings`. */
+  private report: ServedHealth;
 
   /** Load problems of the last accepted load — informational only. */
   readonly problems: LoadProblem[];
@@ -75,16 +81,51 @@ export class RegistryStore {
   /**
    * The writable overlay (workspace §8): API-written documents, keyed on
    * `"<Kind>/<name>"`, merged over the watched set on every accepted
-   * (re)load. In-memory in T2a Task 1; Task 3 persists it behind this seam.
+   * (re)load. Persisted by `overlayStore`: the in-memory map is seeded from
+   * the JSONL file at construction and every accepted append writes the
+   * file line first, then updates the map, in the same synchronous call.
    */
   private readonly overlay = new Map<string, FabricDocument>();
+  private readonly overlayStore: OverlayStore;
 
-  /** Prefer `start(dir)` — the conventional entry that documents cold-start semantics. */
-  constructor(dir: string) {
+  /** Corrupt-line warnings from the start-time overlay read (persist for the store's run). */
+  private readonly overlayLoadWarnings: Warning[];
+
+  /**
+   * The watched documents of the last accepted (re)load — needed for the
+   * overlay-shadow warnings, which compare watched names against overlay
+   * names. Empty until the first accepted load; a rejected reload keeps the
+   * previous value (consistent with the last-good snapshot being served).
+   */
+  private watched: FabricDocument[] = [];
+
+  /**
+   * The warnings health() serves: overlay-load warnings plus the shadowing
+   * warnings of the currently served set. Recomputed on every accepted
+   * (re)load and overlay append; a rejected reload keeps them (they
+   * describe the last-good set still being served).
+   */
+  private warnings: Warning[];
+
+  /**
+   * Prefer `start(dir)` — the conventional entry that documents cold-start
+   * semantics. `overlayPath` overrides the overlay file location
+   * (production default: `<dir>/.twill-overlay.jsonl`, beside the watched
+   * documents; tests pass a temp path when the documents dir must stay
+   * pristine).
+   */
+  constructor(dir: string, overlayPath?: string) {
     this.dir = dir;
+    this.overlayStore = new OverlayStore(overlayPath ?? join(dir, OVERLAY_FILENAME));
+    const loaded = this.overlayStore.load();
+    this.overlayLoadWarnings = loaded.warnings;
+    for (const doc of loaded.documents) {
+      this.overlay.set(documentKey(doc), doc);
+    }
+    this.warnings = [...this.overlayLoadWarnings];
     this.problems = [];
     this.snapshot = EMPTY_SNAPSHOT;
-    this.report = { documentSet: "current", warnings: [] };
+    this.report = { documentSet: "current" };
     this.reload();
     this.setupWatchers();
   }
@@ -101,7 +142,7 @@ export class RegistryStore {
 
   health(): HealthReport {
     const { documentSet, rejectedAt, reason } = this.report;
-    const health: HealthReport = { documentSet, warnings: [] };
+    const health: HealthReport = { documentSet, warnings: [...this.warnings] };
     if (documentSet === "stale") {
       health.rejectedAt = rejectedAt;
       health.reason = reason;
@@ -134,22 +175,29 @@ export class RegistryStore {
           this.snapshot === EMPTY_SNAPSHOT ? "the empty registry" : "the last-good snapshot"
         } (${this.snapshot.documents.length} documents): ${rejection.reason ?? "unknown reason"}`,
       );
-      this.report = { documentSet: "stale", rejectedAt, reason: rejection.reason, warnings: [] };
+      // Warnings are left alone: they describe the set still being served.
+      this.report = { documentSet: "stale", rejectedAt, reason: rejection.reason };
       return;
     }
 
     // The snapshot is the atomicity unit: built fully, then a single swap.
+    this.watched = documents;
     this.snapshot = buildSnapshot(merged, this.snapshot.generation + 1);
-    this.report = { documentSet: "current", warnings: [] };
+    this.warnings = [...this.overlayLoadWarnings, ...shadowWarnings(documents, this.overlay)];
+    this.report = { documentSet: "current" };
   }
 
   /**
    * The overlay write seam (workspace §8): validate the merged set
    * (watched ∪ overlay ∪ `doc`, overlay winning on name collision) through
    * rejectCheck *before* appending; on violation return the error and
-   * change nothing. On success the merged snapshot is rebuilt and swapped
-   * in a single assignment (generation increments), so resolution and
-   * discovery see the document immediately.
+   * change nothing. On success the document is appended to the overlay
+   * FILE and the in-memory map updated synchronously within this call
+   * (file first: a failed write throws before any in-memory state changes,
+   * so the store never serves a document it did not persist), and the
+   * merged snapshot is rebuilt and swapped in a single assignment
+   * (generation increments), so resolution and discovery see the document
+   * immediately.
    */
   appendOverlay(doc: FabricDocument): { ok: boolean; error?: string } {
     const merged = mergeOverlay(this.snapshot.documents, this.overlay, doc);
@@ -157,8 +205,10 @@ export class RegistryStore {
     if (rejection.rejected) {
       return { ok: false, error: rejection.reason ?? "merged document set rejected" };
     }
+    this.overlayStore.append(doc);
     this.overlay.set(documentKey(doc), doc);
     this.snapshot = buildSnapshot(merged, this.snapshot.generation + 1);
+    this.warnings = [...this.overlayLoadWarnings, ...shadowWarnings(this.watched, this.overlay)];
     return { ok: true };
   }
 
@@ -232,6 +282,24 @@ function mergeOverlay(
   return [...merged.values()];
 }
 
+/**
+ * The shadowing warnings (workspace §8): one `overlay-shadow` warning per
+ * overlay document whose `"<Kind>/<name>"` also names a watched document —
+ * the overlay version is the one served.
+ */
+function shadowWarnings(
+  watched: readonly FabricDocument[],
+  overlay: ReadonlyMap<string, FabricDocument>,
+): Warning[] {
+  if (overlay.size === 0) return [];
+  const watchedKeys = new Set(watched.map(documentKey));
+  const warnings: Warning[] = [];
+  for (const key of overlay.keys()) {
+    if (watchedKeys.has(key)) warnings.push({ type: "overlay-shadow", name: key });
+  }
+  return warnings;
+}
+
 /** A snapshot over a merged document list (union already computed). */
 function buildSnapshot(documents: FabricDocument[], generation: number): Snapshot {
   const byName = new Map<string, FabricDocument>();
@@ -249,10 +317,12 @@ function isRecursiveUnavailable(err: unknown): boolean {
 }
 
 /**
- * Open a store on `dir`: performs the initial reload (last-good / empty-on-
- * reject semantics apply to this cold start too) and begins watching with
- * debounced reloads.
+ * Open a store on `dir`: loads the persisted overlay (default
+ * `<dir>/.twill-overlay.jsonl`; `overlayPath` overrides), performs the
+ * initial reload with the overlay merged over the watched set (last-good /
+ * empty-on-reject semantics apply to this cold start too), and begins
+ * watching with debounced reloads.
  */
-export function start(dir: string): RegistryStore {
-  return new RegistryStore(dir);
+export function start(dir: string, overlayPath?: string): RegistryStore {
+  return new RegistryStore(dir, overlayPath);
 }

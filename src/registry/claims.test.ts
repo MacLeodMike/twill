@@ -10,7 +10,7 @@
 // vitest exits cleanly.
 
 import { describe, it, expect, afterEach } from "vitest";
-import { cpSync, mkdtempSync, rmSync } from "node:fs";
+import { cpSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, dirname, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -26,12 +26,30 @@ const openStores: RegistryStore[] = [];
 const openServers: Server[] = [];
 const tempDirs: string[] = [];
 
-/** Fresh temp dir with the fixtures copied in. */
-function tempDocuments(): string {
+/** Fresh temp dir with the fixtures copied in (plus an optional mutation). */
+function tempDocuments(mutate?: (dir: string) => void): string {
   const dir = mkdtempSync(join(tmpdir(), "twill-claims-"));
   cpSync(fixtures, dir, { recursive: true });
+  mutate?.(dir);
   tempDirs.push(dir);
   return dir;
+}
+
+/**
+ * A *good* two-document baseline (same mutation as store.test.ts's): drop
+ * the worktree child, give payments-repo a distinct fingerprint, and strip
+ * its parent link — payments-repo becomes a standalone root whose deletion
+ * cannot trip §8.3 (the orphan-release ruling test deletes it).
+ */
+function tempBaseline(dir: string): void {
+  rmSync(join(dir, "Workspace", "payments-repo-feat-x.yaml"), { force: true });
+  const p = join(dir, "Workspace", "payments-repo.yaml");
+  writeFileSync(
+    p,
+    readFileSync(p, "utf8")
+      .replace("vol-2c4f1a", "vol-payments-01")
+      .replace("  parent: { kind: Workspace, name: workstation-repos }\n", ""),
+  );
 }
 
 function startStore(dir: string): RegistryStore {
@@ -117,8 +135,11 @@ async function patchClaim(base: string, name: string, body: unknown): Promise<Re
  * spec.claim.released: true). Builds from validClaimBody so the release
  * re-asserts the parent's claimedOn identity exactly.
  */
-function releaseBody(name: string): unknown {
-  const body = validClaimBody(name) as { spec: { claim: Record<string, unknown> } };
+function releaseBody(
+  name: string,
+  overrides?: { fingerprint?: string; durableId?: string; route?: unknown },
+): unknown {
+  const body = validClaimBody(name, overrides) as { spec: { claim: Record<string, unknown> } };
   body.spec.claim.released = true;
   return body;
 }
@@ -366,6 +387,69 @@ describe("PATCH /Claim/<name> — claim release (workspace §8: release is the o
     const res = await patchClaim(base, "claim-partial", { spec: { claim: { released: true } } });
     expect(res.status).toBe(400);
     expect(store.get("Claim", "claim-partial")?.kindSpec["released"]).toBe(false);
+  });
+});
+
+describe("orphan release — T2a-2 ruling (release must remain possible for orphan claims)", () => {
+  it("create → delete parent workspace file → reload → release with unchanged parent+claimedOn still succeeds", async () => {
+    const dir = tempDocuments(tempBaseline);
+    const store = startStore(dir);
+    const server = createServer(store);
+    openServers.push(server);
+    await new Promise<void>((done) => server.listen(0, "127.0.0.1", () => done()));
+    const address = server.address();
+    const port = typeof address === "object" && address !== null ? address.port : 0;
+    const base = `http://127.0.0.1:${port}/twill/v1alpha1`;
+
+    // tempBaseline de-aliases payments-repo: fingerprint vol-payments-01, no parent.
+    const created = await postClaim(
+      base,
+      "claim-orphan-rel",
+      validClaimBody("claim-orphan-rel", { fingerprint: "vol-payments-01" }),
+    );
+    expect(created.status).toBe(201);
+
+    // The parent is deleted after the claim exists — §8.3's orphan case:
+    // never a set-level rejection, and the reload stays current.
+    rmSync(join(dir, "Workspace", "payments-repo.yaml"));
+    store.reload();
+    expect(store.get("Workspace", "payments-repo")).toBeUndefined();
+    expect(store.health().documentSet).toBe("current");
+
+    // Unchanged spec.parent + spec.claim.claimedOn ⇒ the release path skips
+    // the parent-existence and claimedOn-consistency re-checks (they were
+    // validated at create; an unreleasable orphan would deadlock the GC path).
+    const res = await patchClaim(base, "claim-orphan-rel", releaseBody("claim-orphan-rel", { fingerprint: "vol-payments-01" }));
+    expect(res.status).toBe(200);
+    const doc = (await res.json()) as { spec: { claim: Record<string, unknown> } };
+    expect(doc.spec.claim.released).toBe(true);
+    expect(store.get("Claim", "claim-orphan-rel")?.kindSpec["released"]).toBe(true);
+  });
+
+  it("orphan release with a CHANGED parent or claimedOn re-validates against the live set (409 missing parent)", () => {
+    const dir = tempDocuments(tempBaseline);
+    const store = startStore(dir);
+    const created = validateClaimCreate(
+      validClaimBody("claim-orphan-strict", { fingerprint: "vol-payments-01" }),
+      "claim-orphan-strict",
+      store,
+    );
+    expect(created.ok).toBe(true);
+    if (!created.ok) return;
+    expect(store.appendOverlay(created.doc).ok).toBe(true);
+
+    rmSync(join(dir, "Workspace", "payments-repo.yaml"));
+    store.reload();
+    expect(store.get("Workspace", "payments-repo")).toBeUndefined();
+
+    // The skip applies only when parent AND claimedOn are unchanged; a
+    // release that moves claimedOn re-runs the create-time checks and hits
+    // the missing parent.
+    const moved = releaseBody("claim-orphan-strict", { fingerprint: "vol-elsewhere" });
+    const checked = validateClaimRelease("claim-orphan-strict", moved, store);
+    expect(checked).toMatchObject({ ok: false, status: 409 });
+    if (!checked.ok) expect(checked.error).toContain("does not exist");
+    expect(store.get("Claim", "claim-orphan-strict")?.kindSpec["released"]).toBe(false);
   });
 });
 

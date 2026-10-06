@@ -27,7 +27,7 @@ import type { RegistryStore } from "./store.js";
 type ClaimFailureStatus = 400 | 409 | 422;
 
 /** Failure statuses the route layer can emit for a claim release (PATCH). */
-type ClaimReleaseFailureStatus = 400 | 404 | 409;
+type ClaimReleaseFailureStatus = 400 | 404 | 409 | 422;
 
 export type ClaimValidation =
   | { ok: true; doc: FabricDocument }
@@ -81,12 +81,20 @@ export function validateClaimCreate(raw: unknown, urlName: string, store: Regist
  * is skipped — every other check (envelope shape, §8.4 claimedOn
  * consistency, POST-time parent existence) applies to the PATCH body too,
  * since it carries the full claim envelope.
+ *
+ * `skipParentChecks` (release path only, the T2a-2 orphan-release ruling):
+ * when the PATCH body's `spec.parent` and `spec.claim.claimedOn` are
+ * unchanged from the stored claim, the parent-existence and
+ * claimedOn-consistency re-checks are skipped — they were validated at
+ * create, and a parent deleted *after* the claim exists is §8.3's orphan
+ * case (an unreleasable orphan would deadlock the GC path). A release that
+ * changes either field re-runs both checks against the live set.
  */
 function validateClaimEnvelope(
   raw: unknown,
   urlName: string,
   store: RegistryStore,
-  opts: { allowExisting: boolean },
+  opts: { allowExisting: boolean; skipParentChecks?: boolean },
 ): ClaimValidation {
   if (!isRecord(raw)) return fail(400, "claim body must be a JSON object");
 
@@ -163,41 +171,43 @@ function validateClaimEnvelope(
     return fail(409, `claim name already exists: Claim/${urlName} (POST cannot overwrite a live claim; PATCH releases)`);
   }
 
-  // POST-time parent existence (core §9): the parent must be an existing,
-  // registered document. A parent deleted *after* the claim exists is an
-  // orphan (inert + health warning), never a set-level rejection.
-  const parent = store.get(parentKind as Kind, parentName);
-  if (parent === undefined) {
-    return fail(409, `claim parent ${parentKind}/${parentName} does not exist in the document set (claims name existing, registered resources only)`);
-  }
+  if (opts.skipParentChecks !== true) {
+    // POST-time parent existence (core §9): the parent must be an existing,
+    // registered document. A parent deleted *after* the claim exists is an
+    // orphan (inert + health warning), never a set-level rejection.
+    const parent = store.get(parentKind as Kind, parentName);
+    if (parent === undefined) {
+      return fail(409, `claim parent ${parentKind}/${parentName} does not exist in the document set (claims name existing, registered resources only)`);
+    }
 
-  // §8.4 consistency: the claim must occupy the object it claims against.
-  const parentDurableId = durableIdOf(parent);
-  if (claimedDurableId !== parentDurableId) {
-    return fail(
-      422,
-      `spec.claim.claimedOn.durable_id ${JSON.stringify(claimedDurableId)} does not equal the parent's durable id ` +
-        `${JSON.stringify(parentDurableId)} (${parentKind}/${parentName})`,
-    );
-  }
-  if (parent.kind === "Workspace") {
-    const parentFingerprint = parent.kindSpec["storage"];
-    const expected =
-      isRecord(parentFingerprint) && typeof parentFingerprint["fingerprint"] === "string"
-        ? parentFingerprint["fingerprint"]
-        : undefined;
-    if (claimedFingerprint !== expected) {
+    // §8.4 consistency: the claim must occupy the object it claims against.
+    const parentDurableId = durableIdOf(parent);
+    if (claimedDurableId !== parentDurableId) {
       return fail(
         422,
-        `spec.claim.claimedOn.fingerprint ${JSON.stringify(claimedFingerprint)} does not equal the parent's ` +
-          `spec.workspace.storage.fingerprint ${JSON.stringify(expected)} (claims occupy the storage they claim against, §8.4)`,
+        `spec.claim.claimedOn.durable_id ${JSON.stringify(claimedDurableId)} does not equal the parent's durable id ` +
+          `${JSON.stringify(parentDurableId)} (${parentKind}/${parentName})`,
       );
     }
-  } else if (claimedFingerprint !== undefined) {
-    return fail(
-      422,
-      `spec.claim.claimedOn.fingerprint must be absent for non-storage-backed parent ${parentKind}/${parentName} (§8.4)`,
-    );
+    if (parent.kind === "Workspace") {
+      const parentFingerprint = parent.kindSpec["storage"];
+      const expected =
+        isRecord(parentFingerprint) && typeof parentFingerprint["fingerprint"] === "string"
+          ? parentFingerprint["fingerprint"]
+          : undefined;
+      if (claimedFingerprint !== expected) {
+        return fail(
+          422,
+          `spec.claim.claimedOn.fingerprint ${JSON.stringify(claimedFingerprint)} does not equal the parent's ` +
+            `spec.workspace.storage.fingerprint ${JSON.stringify(expected)} (claims occupy the storage they claim against, §8.4)`,
+        );
+      }
+    } else if (claimedFingerprint !== undefined) {
+      return fail(
+        422,
+        `spec.claim.claimedOn.fingerprint must be absent for non-storage-backed parent ${parentKind}/${parentName} (§8.4)`,
+      );
+    }
   }
 
   // The document the overlay stores: `released` defaults to false so every
@@ -254,6 +264,12 @@ function validateClaimEnvelope(
  *
  * The returned doc carries the released claim; the route appends it through
  * the same overlay seam as create (the overlay records latest-per-name).
+ *
+ * Orphan releases (the T2a-2 ruling): when the PATCH body's `spec.parent`
+ * and `spec.claim.claimedOn` are unchanged from the stored claim, the
+ * create-path parent-existence and claimedOn-consistency checks are
+ * skipped, so a claim whose parent was deleted after create can still be
+ * released. Changing either field re-enables both checks.
  */
 export function validateClaimRelease(
   urlName: string,
@@ -268,12 +284,18 @@ export function validateClaimRelease(
     return releaseFail(404, `no such claim: Claim/${urlName} (PATCH releases an existing claim only)`);
   }
 
-  // Reuse the create validator for envelope shape and the §8.4 claimedOn
-  // consistency checks. The two create-path conflicts cannot fire here: the
-  // name exists (it is the release target), and the claim's own existence
-  // implies its parent is registered (POST-time parent existence, core §9).
-  const checked = validateClaimEnvelope(raw, urlName, store, { allowExisting: true });
-  if (!checked.ok) return { ok: false, status: checked.status as 400, error: checked.error };
+  // The orphan-release ruling (T2a-2): parent-existence and claimedOn
+  // consistency were validated at create; a parent deleted afterwards must
+  // not make the claim unreleasable. The skip applies only when the PATCH
+  // body leaves spec.parent and spec.claim.claimedOn unchanged — a release
+  // that moves either one re-runs both checks against the live set.
+  const skipParentChecks = parentAndClaimedOnUnchanged(stored.raw, raw);
+
+  // Reuse the create validator for envelope shape and (unless skipped) the
+  // parent checks. The name-collision conflict cannot fire here: the name
+  // exists (it is the release target).
+  const checked = validateClaimEnvelope(raw, urlName, store, { allowExisting: true, skipParentChecks });
+  if (!checked.ok) return { ok: false, status: checked.status, error: checked.error };
 
   // Field-wise diff of normalized submitted vs normalized stored: the
   // release flag is the only permitted difference.
@@ -315,6 +337,32 @@ export function validateClaimRelease(
 
 function releaseFail(status: ClaimReleaseFailureStatus, error: string): { ok: false; status: ClaimReleaseFailureStatus; error: string } {
   return { ok: false, status, error };
+}
+
+/**
+ * The orphan-release skip predicate (T2a-2 ruling): true when the submitted
+ * envelope's `spec.parent` and `spec.claim.claimedOn` are deep-equal to the
+ * stored claim's — the release re-asserts the create-time identity exactly,
+ * so the parent-existence and claimedOn-consistency re-checks would only
+ * re-prove what create already validated (and would deadlock releases once
+ * the parent is gone). Any difference re-enables both checks. Malformed or
+ * absent fields read as *changed* (the shared envelope validator then
+ * produces the 400/409).
+ */
+function parentAndClaimedOnUnchanged(storedRaw: unknown, submittedRaw: unknown): boolean {
+  const storedSpec = isRecord(storedRaw) && isRecord(storedRaw["spec"]) ? storedRaw["spec"] : undefined;
+  const submittedSpec =
+    isRecord(submittedRaw) && isRecord(submittedRaw["spec"]) ? submittedRaw["spec"] : undefined;
+  if (storedSpec === undefined || submittedSpec === undefined) return false;
+  const storedClaim = isRecord(storedSpec["claim"]) ? storedSpec["claim"] : undefined;
+  const submittedClaim = isRecord(submittedSpec["claim"]) ? submittedSpec["claim"] : undefined;
+  if (storedClaim === undefined || submittedClaim === undefined) return false;
+  const parentDiffs: string[] = [];
+  diffValue("", storedSpec["parent"], submittedSpec["parent"], parentDiffs);
+  if (parentDiffs.length > 0) return false;
+  const claimedOnDiffs: string[] = [];
+  diffValue("", storedClaim["claimedOn"], submittedClaim["claimedOn"], claimedOnDiffs);
+  return claimedOnDiffs.length === 0;
 }
 
 /**

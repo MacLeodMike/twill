@@ -24,6 +24,10 @@ export type LoadResult = { documents: FabricDocument[]; problems: LoadProblem[] 
 // single-kind store: a top-level file's kind comes from its `kind` field,
 // so a flat file loads regardless of directory. Any other subdirectory
 // name (or nested deeper directory) is foreign — skipped with a problem.
+// Dot-prefixed entries are skipped silently at every level: they are
+// registry-private files (the T2a writable overlay lives beside the
+// documents as `<documentsDir>/.twill-overlay.jsonl`), never documents and
+// never problems.
 //
 // Kinds registered with a kind-runner in T1: Workspace only. Other kinds
 // parse as documents but load inert (core §10.2 / T1 scope).
@@ -48,6 +52,9 @@ export function loadDirectory(dir: string): LoadResult {
   }
 
   for (const entry of entries) {
+    // Dot-prefixed entries are registry-private (e.g. `.twill-overlay.jsonl`)
+    // — skipped silently, never a document and never a problem.
+    if (entry.startsWith(".")) continue;
     const path = join(dir, entry);
     const stats = safeStat(path, problems);
     if (stats === null) continue;
@@ -85,6 +92,8 @@ function loadKindDir(dir: string, _kind: Kind, documents: FabricDocument[], prob
     return;
   }
   for (const entry of entries) {
+    // Dot-prefixed entries are registry-private — skipped silently.
+    if (entry.startsWith(".")) continue;
     const path = join(dir, entry);
     const stats = safeStat(path, problems);
     if (stats === null) continue;
@@ -129,9 +138,14 @@ function loadFile(path: string, documents: FabricDocument[], problems: LoadProbl
   documents.push(buildDocument(raw, path));
 }
 
-function buildDocument(raw: Record<string, unknown>, path: string): FabricDocument {
-  const inertReasons: string[] = [];
-
+/**
+ * The field projection from a parsed envelope to a FabricDocument — pure
+ * extraction, no validation. Shared by the watched loader (buildDocument,
+ * which adds inert-marking) and the overlay loader (overlay.ts, which
+ * trusts the envelope and keeps the projected defaults `resolvable: true`,
+ * `inertReasons: []`).
+ */
+export function projectDocument(raw: Record<string, unknown>, path: string): FabricDocument {
   // Envelope shape (core §3): metadata, spec; status is reader-ignored.
   const metadata = isRecord(raw["metadata"]) ? (raw["metadata"] as Record<string, unknown>) : {};
   const spec = isRecord(raw["spec"]) ? (raw["spec"] as Record<string, unknown>) : {};
@@ -148,7 +162,37 @@ function buildDocument(raw: Record<string, unknown>, path: string): FabricDocume
   const kindSpec = kind !== undefined && isRecord(spec[kind.toLowerCase()]) ? (spec[kind.toLowerCase()] as Record<string, unknown>) : {};
   const parent = isRecord(spec["parent"]) ? readParent(spec["parent"]) : undefined;
 
-  // Inert-marking (never a load rejection for well-formed YAML):
+  const doc: FabricDocument = {
+    apiVersion,
+    // Unknown kinds stay in the document set (inert) — the Kind union can't
+    // express them, so the raw string is carried in the pinned `kind` field.
+    kind: kind ?? (typeof rawKind === "string" ? (rawKind as Kind) : ("Unknown" as Kind)),
+    name,
+    labels,
+    owner,
+    routes,
+    kindSpec,
+    parent,
+    resolvable: true,
+    inertReasons: [],
+    sourcePath: path,
+    raw,
+  };
+  return doc;
+}
+
+/** The loader's inert-marking checks (never a load rejection for well-formed YAML). */
+function inertReasonsFor(raw: Record<string, unknown>): string[] {
+  const inertReasons: string[] = [];
+  const metadata = isRecord(raw["metadata"]) ? (raw["metadata"] as Record<string, unknown>) : {};
+  const spec = isRecord(raw["spec"]) ? (raw["spec"] as Record<string, unknown>) : {};
+  const apiVersion = typeof raw["apiVersion"] === "string" ? (raw["apiVersion"] as string) : "";
+  const rawKind = raw["kind"];
+  const kind: Kind | undefined = KINDS.includes(rawKind as Kind) ? (rawKind as Kind) : undefined;
+  const name = typeof metadata["name"] === "string" ? (metadata["name"] as string) : "";
+  const owner = typeof spec["owner"] === "string" ? (spec["owner"] as string) : "";
+  const kindSpec = kind !== undefined && isRecord(spec[kind.toLowerCase()]) ? (spec[kind.toLowerCase()] as Record<string, unknown>) : {};
+
   if (kind === undefined) {
     inertReasons.push(rawKind === undefined ? "missing kind" : `unknown kind: ${String(rawKind)}`);
   }
@@ -177,23 +221,14 @@ function buildDocument(raw: Record<string, unknown>, path: string): FabricDocume
       }
     }
   }
+  return inertReasons;
+}
 
-  const doc: FabricDocument = {
-    apiVersion,
-    // Unknown kinds stay in the document set (inert) — the Kind union can't
-    // express them, so the raw string is carried in the pinned `kind` field.
-    kind: kind ?? (typeof rawKind === "string" ? (rawKind as Kind) : ("Unknown" as Kind)),
-    name,
-    labels,
-    owner,
-    routes,
-    kindSpec,
-    parent,
-    resolvable: inertReasons.length === 0,
-    inertReasons,
-    sourcePath: path,
-    raw,
-  };
+function buildDocument(raw: Record<string, unknown>, path: string): FabricDocument {
+  const doc = projectDocument(raw, path);
+  const inertReasons = inertReasonsFor(raw);
+  doc.inertReasons.push(...inertReasons);
+  doc.resolvable = inertReasons.length === 0;
   return doc;
 }
 
