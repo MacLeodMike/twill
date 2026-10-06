@@ -34,8 +34,8 @@ function tempDocuments(): string {
   return dir;
 }
 
-function startStore(dir: string): RegistryStore {
-  const store = start(dir);
+function startStore(dir: string, overlayPath?: string): RegistryStore {
+  const store = start(dir, overlayPath);
   openStores.push(store);
   return store;
 }
@@ -91,6 +91,22 @@ function appendClaim(store: RegistryStore, name: string): void {
 }
 
 const OVERLAY_FILE = ".twill-overlay.jsonl";
+
+/** Free a store from the afterEach close list (when a test replaces it mid-run). */
+function untrack(store: RegistryStore): void {
+  const idx = openStores.indexOf(store);
+  if (idx !== -1) openStores.splice(idx, 1);
+}
+
+/** Boot `store` on an ephemeral port; tracked for afterEach shutdown. */
+async function serve(store: RegistryStore): Promise<string> {
+  const server = createServer(store);
+  openServers.push(server);
+  await new Promise<void>((done) => server.listen(0, "127.0.0.1", () => done()));
+  const address = server.address();
+  const port = typeof address === "object" && address !== null ? address.port : 0;
+  return `http://127.0.0.1:${port}/twill/v1alpha1`;
+}
 
 describe("overlay persistence — JSONL at <documentsDir>/.twill-overlay.jsonl", () => {
   it("(a) restart durability: claim → close → reopen → claim present, in discovery, claimedOn intact (Review Focus #4)", async () => {
@@ -218,5 +234,38 @@ status: {}
     // Still exactly one claim under the name after the restart reduction.
     expect(second.current().documents.filter((d) => d.kind === "Claim")).toHaveLength(1);
     expect(second.health()).toEqual({ documentSet: "current", warnings: [] });
+  });
+
+  it("(review P1) overlay write fault answers 500 JSON instead of crashing the process; the server keeps serving", async () => {
+    const dir = tempDocuments();
+
+    // A store whose overlay write throws synchronously on every append:
+    // appendFileSync to a path inside a deleted directory → ENOENT (the
+    // read-only-mount deployment fault in miniature — the file was readable
+    // at start, so the overlay loads empty and the store is healthy).
+    const deadDir = mkdtempSync(join(tmpdir(), "twill-dead-overlay-"));
+    const deadOverlay = join(deadDir, OVERLAY_FILE);
+    rmSync(deadDir, { recursive: true, force: true });
+
+    const store = startStore(dir);
+    untrack(store);
+    store.close(); // frees the watchers on `dir` before store2 boots on it
+    const store2 = startStore(dir, deadOverlay);
+    const base = await serve(store2);
+
+    const res = await fetch(`${base}/Claim/claim-fault`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify(validClaimBody("claim-fault")),
+    });
+    expect(res.status).toBe(500);
+    const json = (await res.json()) as { error: string };
+    expect(json.error).toContain("internal error");
+
+    // The append threw before any in-memory state changed: the claim was
+    // never accepted, and the same server answers the next request fine.
+    expect(store2.get("Claim", "claim-fault")).toBeUndefined();
+    const discovery = await fetch(base);
+    expect(discovery.status).toBe(200);
   });
 });

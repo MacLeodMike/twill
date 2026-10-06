@@ -26,6 +26,7 @@ export type HttpStatus =
   | 404 // unknown path or absent document (PATCH on a missing claim, T2a)
   | 409 // claim conflicts: existing Claim name, missing parent, PATCH mutating beyond release (T2a)
   | 422 // claimedOn inconsistent with the parent document (T2a, §8.4)
+  | 500 // internal fault (e.g. the overlay write failing — readJsonBody's last-resort guard)
   | 501; // T1-deferred surface (claim GET paths, overlay)
 
 /** The T1-deferred bodies (Global Constraints + workspace §8). */
@@ -43,8 +44,9 @@ export const API_PREFIX = "/twill/v1alpha1";
 /**
  * Dispatch one request against `store`. `req.url` is the request path
  * (query string ignored — T1 has no query-parameter surface that works:
- * `/claims` is 501 and the rest is queryless). Never throws; every
- * failure path is a JSON response.
+ * `/claims` is 501 and the rest is queryless). Never throws itself; body-
+ * handling failures are answered as JSON by readJsonBody's last-resort
+ * 500 guard (server.ts's try/catch cannot contain async body callbacks).
  */
 export function route(store: RegistryStore, req: IncomingMessage, res: ServerResponse): void {
   const path = (req.url ?? "").split("?")[0] ?? "";
@@ -326,7 +328,18 @@ function readJsonBody(req: IncomingMessage, res: ServerResponse, then: (body: un
       respond(res, 400, { error: `malformed JSON body: ${String(err)}` });
       return;
     }
-    then(body);
+    // Last-resort guard for handler faults — this callback runs after
+    // route() returned, so server.ts's try/catch cannot contain a throw
+    // here and no process-level uncaughtException handler exists (the
+    // overlay write fault — ENOSPC/EACCES/EROFS on append — was the
+    // review-P1 crash). Answer 500 JSON and keep the process alive; the
+    // store is untouched (appendOverlay validates and persists before any
+    // in-memory change).
+    try {
+      then(body);
+    } catch (err) {
+      respond(res, 500, { error: `internal error: ${String(err)}` });
+    }
   });
   req.on("error", () => {
     respond(res, 400, { error: "request body read failed" });

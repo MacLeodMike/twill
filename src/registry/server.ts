@@ -16,8 +16,11 @@ export function createServer(store: RegistryStore): Server {
     try {
       route(store, req, res);
     } catch (err) {
-      // route() is written never to throw; this is a last-resort guard so
-      // a bug can't take the process down (single-replica availability).
+      // Last-resort guard for the dispatch itself (route() is written never
+      // to throw) so a bug can't take the process down. Request-body
+      // handlers run asynchronously in readJsonBody AFTER route() returns,
+      // so this try/catch cannot contain their faults — readJsonBody wraps
+      // its own handler invocation with a 500 JSON answer instead.
       const payload = JSON.stringify({ error: `internal error: ${String(err)}` });
       res.writeHead(500, { "content-type": "application/json" });
       res.end(payload);
