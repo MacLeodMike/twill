@@ -12,7 +12,7 @@ import type { IncomingMessage, ServerResponse } from "node:http";
 import { KINDS, durableIdOf, isRecord, type FabricDocument, type Kind } from "./document.js";
 import { resolve, type Consumer } from "./resolver.js";
 import { documentKey } from "./lineage.js";
-import { validateClaimCreate } from "./claims.js";
+import { validateClaimCreate, validateClaimRelease } from "./claims.js";
 import type { RegistryStore } from "./store.js";
 import { neverObservedDefault, type StatusCache, type StatusSurface } from "./status.js";
 
@@ -20,13 +20,13 @@ import { neverObservedDefault, type StatusCache, type StatusSurface } from "./st
 export type RouteError = { httpStatus: 400 | 404; error: string };
 
 export type HttpStatus =
-  | 200 // success
+  | 200 // success (incl. claim release + idempotent re-release, T2a)
   | 201 // claim created (T2a)
   | 400 // malformed body / missing or ill-typed fields
-  | 404 // unknown path or absent document
-  | 409 // claim conflicts: existing Claim name, missing parent (T2a)
+  | 404 // unknown path or absent document (PATCH on a missing claim, T2a)
+  | 409 // claim conflicts: existing Claim name, missing parent, PATCH mutating beyond release (T2a)
   | 422 // claimedOn inconsistent with the parent document (T2a, §8.4)
-  | 501; // T1-deferred surface (claim PATCH/GET paths, overlay)
+  | 501; // T1-deferred surface (claim GET paths, overlay)
 
 /** The T1-deferred bodies (Global Constraints + workspace §8). */
 export const CLAIMS_UNIMPLEMENTED = {
@@ -90,10 +90,10 @@ export function route(store: RegistryStore, req: IncomingMessage, res: ServerRes
     respond(res, 200, store.health());
     return;
   }
-  // /Claim/<name>: POST creates the claim (T2a); GET and PATCH stay
-  // T1-deferred (PATCH releases land in Task 2, GET /claims in Task 5).
-  // Any other method falls through to the generic method-not-supported
-  // 404 below.
+  // /Claim/<name>: POST creates the claim, PATCH releases it (T2a Tasks
+  // 1+2 — release is the only permitted mutation, workspace §8). GET stays
+  // T1-deferred (GET /claims lands in Task 5). Any other method falls
+  // through to the generic method-not-supported 404 below.
   if (first === "Claim" && second !== undefined && third === undefined) {
     if (method === "POST") {
       readJsonBody(req, res, (body) => {
@@ -113,7 +113,30 @@ export function route(store: RegistryStore, req: IncomingMessage, res: ServerRes
       });
       return;
     }
-    if (method === "GET" || method === "PATCH") {
+    if (method === "PATCH") {
+      readJsonBody(req, res, (body) => {
+        const checked = validateClaimRelease(second, body, store);
+        if (!checked.ok) {
+          respond(res, checked.status, { error: checked.error });
+          return;
+        }
+        // Idempotent no-op (re-release of an already-released claim): serve
+        // the stored claim without appending to the overlay.
+        if (store.get("Claim", second) === checked.doc) {
+          respond(res, 200, checked.doc.raw);
+          return;
+        }
+        const appended = store.appendOverlay(checked.doc);
+        if (!appended.ok) {
+          // Same write-time merged-set validation as create.
+          respond(res, 409, { error: appended.error ?? "merged document set rejected" });
+          return;
+        }
+        respond(res, 200, checked.doc.raw);
+      });
+      return;
+    }
+    if (method === "GET") {
       respond(res, 501, CLAIMS_UNIMPLEMENTED);
       return;
     }

@@ -287,7 +287,7 @@ describe("(f) POST statusReport then resolve — the descriptor reflects the rep
   });
 });
 
-describe("(g) claims surface — POST creates (T2a); the other claim methods keep the T1 501", () => {
+describe("(g) claims surface — POST creates + PATCH releases (T2a); the claim GETs keep the T1 501", () => {
   it("POST /Claim/<name> → 400 on a malformed body (shape checks precede parent lookup; the full create contract lives in claims.test.ts)", async () => {
     const { base } = await boot();
     const res = await post(base, "/Claim/x", { spec: { claim: { principal: "user:test" } } });
@@ -295,15 +295,15 @@ describe("(g) claims surface — POST creates (T2a); the other claim methods kee
     expect(((await res.json()) as { error: string }).error).toContain("apiVersion");
   });
 
-  it("PATCH /Claim/<name> → the same 501", async () => {
+  it("PATCH /Claim/<name> → 404 on a missing claim (the release contract lives in claims.test.ts)", async () => {
     const { base } = await boot();
     const res = await fetch(`${base}/Claim/x`, {
       method: "PATCH",
       headers: { "content-type": "application/json" },
-      body: JSON.stringify({ "spec.claim.released": true }),
+      body: JSON.stringify({ spec: { claim: { released: true } } }),
     });
-    expect(res.status).toBe(501);
-    expect(await res.json()).toEqual({ error: "claims unimplemented in T1 milestone", milestone: "T2" });
+    expect(res.status).toBe(404);
+    expect(((await res.json()) as { error: string }).error).toContain("Claim/x");
   });
 
   it("GET /Claim/<name> → the same 501 (no claim can exist in T1; a GET can never succeed)", async () => {

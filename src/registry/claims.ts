@@ -1,12 +1,16 @@
-// Claim document validation (T2a Task 1) — the create path for
-// POST /Claim/<name>: envelope checks against core §9's pinned shape,
-// POST-time parent existence (core §9: "Missing parents are rejected at
-// POST time"), the §8.4 claimedOn consistency rule (a claim occupies the
-// storage it claims against), and the workspace §8 claim collision rule
-// (POST against an existing Claim name is rejected).
+// Claim document validation (T2a Tasks 1+2) — POST /Claim/<name> create
+// and PATCH /Claim/<name> release. Create: envelope checks against core
+// §9's pinned shape, POST-time parent existence (core §9: "Missing parents
+// are rejected at POST time"), the §8.4 claimedOn consistency rule (a
+// claim occupies the storage it claims against), and the workspace §8
+// claim collision rule (POST against an existing Claim name is rejected).
+// Release (Task 2): the only permitted mutation — the PATCH body carries
+// the full claim envelope and, after normalization, may differ from the
+// stored claim only by `spec.claim.released: true`; anything else is a 409
+// naming the offending field(s).
 //
-// `validateClaimCreate` is the single validator; the route layer
-// (routes.ts) maps its failure statuses straight onto the HTTP response.
+// The validators return the document to append; the route layer
+// (routes.ts) maps failure statuses straight onto the HTTP response.
 // Write-time set validation (§8.3 over watched ∪ overlay ∪ new) is the
 // store's job — `store.appendOverlay` — not this module's.
 
@@ -22,9 +26,16 @@ import type { RegistryStore } from "./store.js";
 /** Failure statuses the route layer can emit for a claim create. */
 type ClaimFailureStatus = 400 | 409 | 422;
 
+/** Failure statuses the route layer can emit for a claim release (PATCH). */
+type ClaimReleaseFailureStatus = 400 | 404 | 409;
+
 export type ClaimValidation =
   | { ok: true; doc: FabricDocument }
   | { ok: false; status: ClaimFailureStatus; error: string };
+
+export type ClaimReleaseValidation =
+  | { ok: true; doc: FabricDocument }
+  | { ok: false; status: ClaimReleaseFailureStatus; error: string };
 
 type ClaimFailure = { ok: false; status: ClaimFailureStatus; error: string };
 
@@ -59,6 +70,24 @@ function readRequiredString(
  * claimedOn consistency checks (422s) since those read the parent's fields.
  */
 export function validateClaimCreate(raw: unknown, urlName: string, store: RegistryStore): ClaimValidation {
+  return validateClaimEnvelope(raw, urlName, store, { allowExisting: false });
+}
+
+/**
+ * The shared claim-body validator behind both claim writes. With
+ * `allowExisting: false` this is create (POST): an existing Claim of the
+ * URL name is a 409 collision. With `allowExisting: true` (PATCH release)
+ * the target claim necessarily already exists, so the name-collision check
+ * is skipped — every other check (envelope shape, §8.4 claimedOn
+ * consistency, POST-time parent existence) applies to the PATCH body too,
+ * since it carries the full claim envelope.
+ */
+function validateClaimEnvelope(
+  raw: unknown,
+  urlName: string,
+  store: RegistryStore,
+  opts: { allowExisting: boolean },
+): ClaimValidation {
   if (!isRecord(raw)) return fail(400, "claim body must be a JSON object");
 
   // Envelope (core §3/§9): apiVersion, kind, metadata.name, spec.
@@ -128,8 +157,9 @@ export function validateClaimCreate(raw: unknown, urlName: string, store: Regist
 
   // Claim collision rule (workspace §8): the name must be unique across
   // the merged set (watched ∪ overlay) — a live claim cannot be silently
-  // overwritten by another consumer.
-  if (store.get("Claim", urlName) !== undefined) {
+  // overwritten by another consumer. Skipped for the PATCH path: the claim
+  // being patched exists by definition.
+  if (!opts.allowExisting && store.get("Claim", urlName) !== undefined) {
     return fail(409, `claim name already exists: Claim/${urlName} (POST cannot overwrite a live claim; PATCH releases)`);
   }
 
@@ -206,6 +236,128 @@ export function validateClaimCreate(raw: unknown, urlName: string, store: Regist
     raw: docRaw,
   };
   return { ok: true, doc };
+}
+
+/**
+ * Validate a PATCH /Claim/<urlName> body (workspace §8's claim collision
+ * rule: a live claim cannot be silently overwritten — release is the only
+ * permitted mutation). The PATCH body must carry the full claim envelope;
+ * after normalization the only allowed difference vs the stored claim is
+ * `spec.claim.released: true`.
+ *
+ * Failure statuses: 404 the claim is absent (or malformed path); 400 the
+ * body is not a well-formed claim envelope (envelope/§8.4 checks are shared
+ * with create — a PATCH that fails them is malformed, never a conflict);
+ * 409 names every field where the submitted claim differs from the stored
+ * one beyond the release flag. Idempotent: PATCHing an already-released
+ * claim with `released: true` is an ok no-op.
+ *
+ * The returned doc carries the released claim; the route appends it through
+ * the same overlay seam as create (the overlay records latest-per-name).
+ */
+export function validateClaimRelease(
+  urlName: string,
+  raw: unknown,
+  store: RegistryStore,
+): ClaimReleaseValidation {
+  if (urlName === "") return releaseFail(400, "claim name is required (PATCH /Claim/<name>)");
+
+  // The release target: latest-per-name from the merged set (watched ∪ overlay).
+  const stored = store.get("Claim", urlName);
+  if (stored === undefined) {
+    return releaseFail(404, `no such claim: Claim/${urlName} (PATCH releases an existing claim only)`);
+  }
+
+  // Reuse the create validator for envelope shape and the §8.4 claimedOn
+  // consistency checks. The two create-path conflicts cannot fire here: the
+  // name exists (it is the release target), and the claim's own existence
+  // implies its parent is registered (POST-time parent existence, core §9).
+  const checked = validateClaimEnvelope(raw, urlName, store, { allowExisting: true });
+  if (!checked.ok) return { ok: false, status: checked.status as 400, error: checked.error };
+
+  // Field-wise diff of normalized submitted vs normalized stored: the
+  // release flag is the only permitted difference.
+  const violations = claimFieldDiffs(stored.raw, checked.doc.raw);
+  if (violations.length > 0) {
+    return releaseFail(
+      409,
+      `claim PATCH may only set spec.claim.released: true (claim collision rule, workspace §8); ` +
+        `offending field(s): ${violations.join(", ")}`,
+    );
+  }
+  if (!isRecord(raw)) {
+    // Unreachable: the shared envelope validator rejects non-records.
+    // Keeps the submitted `released` read below type-safe without re-narrowing.
+    return releaseFail(400, "claim body must be a JSON object");
+  }
+  const submittedClaim = (raw as Record<string, unknown>)["spec"] as Record<string, unknown>;
+  const submittedReleased = (submittedClaim["claim"] as Record<string, unknown>)["released"];
+  const storedReleased = stored.kindSpec["released"] === true;
+
+  // Direction rule (the release half of the collision rule): the only
+  // permitted release change is false → true. An unchanged flag (true on an
+  // already-released claim) is an idempotent no-op; flipping true → false is
+  // a forbidden re-claim of a released claim.
+  if (submittedReleased === false && storedReleased) {
+    return releaseFail(
+      409,
+      "spec.claim.released may only transition false → true: a released claim cannot be re-claimed " +
+        "(claim collision rule, workspace §8)",
+    );
+  }
+  if (submittedReleased !== true) {
+    // No field difference and no release: nothing to append (submitted is
+    // byte-identical to the stored, still-unreleased claim).
+    return { ok: true, doc: stored };
+  }
+  return { ok: true, doc: checked.doc };
+}
+
+function releaseFail(status: ClaimReleaseFailureStatus, error: string): { ok: false; status: ClaimReleaseFailureStatus; error: string } {
+  return { ok: false, status, error };
+}
+
+/**
+ * Dot-paths where the normalized stored claim and the normalized submitted
+ * claim differ — excluding `spec.claim.released` (the release flag is
+ * adjudicated separately by the direction rule). Compares the create-
+ * normalized projections (Task 1's validateClaimCreate output: URL-named
+ * metadata, `released` defaulted in, routes defaulted to []), so envelope
+ * trivia like an omitted metadata.labels never reads as a mutation.
+ */
+function claimFieldDiffs(storedRaw: unknown, submittedRaw: unknown): string[] {
+  const diffs: string[] = [];
+  diffValue("", storedRaw, submittedRaw, diffs);
+  return diffs.filter((path) => path !== "spec.claim.released" && !path.startsWith("spec.claim.released."));
+}
+
+/** Recursive JSON-value diff; records the dot-path of each unequal leaf. */
+function diffValue(path: string, a: unknown, b: unknown, diffs: string[]): void {
+  if (isRecord(a) && isRecord(b)) {
+    for (const key of new Set([...Object.keys(a), ...Object.keys(b)])) {
+      diffValue(path === "" ? key : `${path}.${key}`, a[key], b[key], diffs);
+    }
+    return;
+  }
+  if (Array.isArray(a) && Array.isArray(b)) {
+    if (a.length !== b.length) {
+      diffs.push(path);
+      return;
+    }
+    for (let i = 0; i < a.length; i++) {
+      diffValue(`${path}[${i}]`, a[i], b[i], diffs);
+    }
+    return;
+  }
+  if (!jsonScalarEquals(a, b)) diffs.push(path);
+}
+
+/** Scalar/array-element equality; arrays of arrays recur element-wise. */
+function jsonScalarEquals(a: unknown, b: unknown): boolean {
+  if (Array.isArray(a) && Array.isArray(b)) {
+    return a.length === b.length && a.every((value, i) => jsonScalarEquals(value, b[i]));
+  }
+  return a === b;
 }
 
 function readLabels(metadata: Record<string, unknown> | undefined): Record<string, string> {

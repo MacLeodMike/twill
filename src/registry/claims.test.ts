@@ -17,7 +17,7 @@ import { fileURLToPath } from "node:url";
 import type { Server } from "node:http";
 import { start, type RegistryStore } from "./store.js";
 import { createServer } from "./server.js";
-import { validateClaimCreate } from "./claims.js";
+import { validateClaimCreate, validateClaimRelease } from "./claims.js";
 
 const here = dirname(fileURLToPath(import.meta.url));
 const fixtures = resolve(here, "../../fixtures/documents");
@@ -101,6 +101,26 @@ async function postClaim(base: string, name: string, body: unknown): Promise<Res
     headers: { "content-type": "application/json" },
     body: JSON.stringify(body),
   });
+}
+
+async function patchClaim(base: string, name: string, body: unknown): Promise<Response> {
+  return fetch(`${base}/Claim/${name}`, {
+    method: "PATCH",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify(body),
+  });
+}
+
+/**
+ * The release PATCH body: the full claim envelope (PATCH carries the whole
+ * document — the only permitted change vs the stored claim is
+ * spec.claim.released: true). Builds from validClaimBody so the release
+ * re-asserts the parent's claimedOn identity exactly.
+ */
+function releaseBody(name: string): unknown {
+  const body = validClaimBody(name) as { spec: { claim: Record<string, unknown> } };
+  body.spec.claim.released = true;
+  return body;
 }
 
 describe("POST /Claim/<name> — claim create (core §9, workspace §8)", () => {
@@ -262,19 +282,129 @@ describe("appendOverlay — the write-time validation seam", () => {
   });
 });
 
-describe("claim surface — still 501 in Task 1", () => {
-  it("PATCH /Claim/<name>, GET /Claim/<name>, GET /claims keep the T1 501", async () => {
-    const { base } = await boot();
-    const patch = await fetch(`${base}/Claim/x`, {
-      method: "PATCH",
-      headers: { "content-type": "application/json" },
-      body: JSON.stringify({ "spec.claim.released": true }),
-    });
-    expect(patch.status).toBe(501);
-    expect(await patch.json()).toEqual({ error: "claims unimplemented in T1 milestone", milestone: "T2" });
+describe("PATCH /Claim/<name> — claim release (workspace §8: release is the only permitted mutation)", () => {
+  it("(a) release an existing claim → 200, released true, overlay records the released version latest-per-name", async () => {
+    const { base, store } = await boot();
+    const created = await postClaim(base, "claim-rel", validClaimBody("claim-rel"));
+    expect(created.status).toBe(201);
 
+    const res = await patchClaim(base, "claim-rel", releaseBody("claim-rel"));
+    expect(res.status).toBe(200);
+    const doc = (await res.json()) as { metadata: { name: string }; spec: { claim: Record<string, unknown> } };
+    expect(doc.metadata.name).toBe("claim-rel");
+    expect(doc.spec.claim.released).toBe(true);
+    // Untouched fields ride through verbatim.
+    expect(doc.spec.claim.id).toBe("cl_test-claim-rel");
+
+    // The overlay now holds the released version — readers see latest-per-name.
+    expect(store.get("Claim", "claim-rel")?.kindSpec["released"]).toBe(true);
+    // Discovery reflects the release immediately (no reload).
+    expect(
+      store.current().documents.find((d) => d.kind === "Claim" && d.name === "claim-rel")?.kindSpec["released"],
+    ).toBe(true);
+  });
+
+  it("(b) PATCH on a missing claim → 404", async () => {
+    const { base, store } = await boot();
+    const res = await patchClaim(base, "claim-absent", releaseBody("claim-absent"));
+    expect(res.status).toBe(404);
+    const json = (await res.json()) as { error: string };
+    expect(json.error).toContain("claim-absent");
+    expect(store.current().documents.filter((d) => d.kind === "Claim")).toHaveLength(0);
+  });
+
+  it("(c) PATCH changing spec.claim.parameters → 409 naming the field; stored claim untouched", async () => {
+    const { base, store } = await boot();
+    const created = await postClaim(base, "claim-mut", validClaimBody("claim-mut"));
+    expect(created.status).toBe(201);
+
+    const body = releaseBody("claim-mut") as { spec: { claim: Record<string, unknown> } };
+    body.spec.claim.parameters = { branch: "main" };
+    const res = await patchClaim(base, "claim-mut", body);
+    expect(res.status).toBe(409);
+    const json = (await res.json()) as { error: string };
+    expect(json.error).toContain("spec.claim.parameters");
+
+    // The stored claim keeps its original parameters and stays unreleased.
+    const stored = store.get("Claim", "claim-mut");
+    expect(stored?.kindSpec["parameters"]).toEqual({ branch: "feat-x", worktreeName: "feat-x" });
+    expect(stored?.kindSpec["released"]).toBe(false);
+  });
+
+  it("(d) re-release an already-released claim → 200 idempotent (no-op release)", async () => {
+    const { base, store } = await boot();
+    await postClaim(base, "claim-idem", validClaimBody("claim-idem"));
+    const first = await patchClaim(base, "claim-idem", releaseBody("claim-idem"));
+    expect(first.status).toBe(200);
+
+    const second = await patchClaim(base, "claim-idem", releaseBody("claim-idem"));
+    expect(second.status).toBe(200);
+    expect(store.get("Claim", "claim-idem")?.kindSpec["released"]).toBe(true);
+    // Still exactly one claim under the name — the overlay holds latest-per-name.
+    expect(store.current().documents.filter((d) => d.kind === "Claim")).toHaveLength(1);
+  });
+
+  it("(extra) PATCH attempting to re-claim after release (released: false) → 409 naming spec.claim.released", async () => {
+    const { base, store } = await boot();
+    await postClaim(base, "claim-unrel", validClaimBody("claim-unrel"));
+    await patchClaim(base, "claim-unrel", releaseBody("claim-unrel"));
+
+    // An explicit released: false against the released claim flips the flag
+    // true → false: a forbidden re-claim, diff-named at spec.claim.released.
+    const body = validClaimBody("claim-unrel") as { spec: { claim: Record<string, unknown> } };
+    body.spec.claim.released = false;
+    const res = await patchClaim(base, "claim-unrel", body);
+    expect(res.status).toBe(409);
+    const json = (await res.json()) as { error: string };
+    expect(json.error).toContain("spec.claim.released");
+    expect(store.get("Claim", "claim-unrel")?.kindSpec["released"]).toBe(true);
+  });
+
+  it("(extra) PATCH with a partial body (no envelope) → 400; store untouched", async () => {
+    const { base, store } = await boot();
+    await postClaim(base, "claim-partial", validClaimBody("claim-partial"));
+    const res = await patchClaim(base, "claim-partial", { spec: { claim: { released: true } } });
+    expect(res.status).toBe(400);
+    expect(store.get("Claim", "claim-partial")?.kindSpec["released"]).toBe(false);
+  });
+});
+
+describe("validateClaimRelease — unit-level pins", () => {
+  it("changing spec.claim.id → 409 naming it (a non-released mutation on an existing parent)", () => {
+    const store = startStore(tempDocuments());
+    const created = validateClaimCreate(validClaimBody("claim-unit"), "claim-unit", store);
+    expect(created.ok).toBe(true);
+    if (!created.ok) return;
+    expect(store.appendOverlay(created.doc).ok).toBe(true);
+
+    const body = releaseBody("claim-unit") as { spec: { claim: Record<string, unknown> } };
+    body.spec.claim.id = "cl_test-swapped";
+    const checked = validateClaimRelease("claim-unit", body, store);
+    expect(checked).toMatchObject({ ok: false, status: 409 });
+    if (!checked.ok) expect(checked.error).toContain("spec.claim.id");
+  });
+
+  it("re-pointing the parent at a nonexistent workspace → 409 (parent existence still enforced, envelope-level)", () => {
+    const store = startStore(tempDocuments());
+    const created = validateClaimCreate(validClaimBody("claim-unit2"), "claim-unit2", store);
+    expect(created.ok).toBe(true);
+    if (!created.ok) return;
+    expect(store.appendOverlay(created.doc).ok).toBe(true);
+
+    const body = releaseBody("claim-unit2") as { spec: { parent: { kind: string; name: string } } };
+    body.spec.parent = { kind: "Workspace", name: "no-such-workspace" };
+    const checked = validateClaimRelease("claim-unit2", body, store);
+    expect(checked).toMatchObject({ ok: false, status: 409 });
+    if (!checked.ok) expect(checked.error).toContain("no-such-workspace");
+  });
+});
+
+describe("claim surface — GET paths still 501 in Task 2", () => {
+  it("GET /Claim/<name> and GET /claims keep the T1 501", async () => {
+    const { base } = await boot();
     const getOne = await fetch(`${base}/Claim/x`);
     expect(getOne.status).toBe(501);
+    expect(await getOne.json()).toEqual({ error: "claims unimplemented in T1 milestone", milestone: "T2" });
 
     const getClaims = await fetch(`${base}/claims?parent=Workspace/payments-repo`);
     expect(getClaims.status).toBe(501);
