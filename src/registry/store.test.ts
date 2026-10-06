@@ -2,9 +2,12 @@
 // last-good snapshots, snapshot consistency (Review Focus #4).
 //
 // Each test copies the fixtures into a fresh temp dir (never watches the
-// fixture dir itself) and mutates the copy. Watcher-driven tests poll with
-// a deadline instead of a fixed sleep; deterministic cases call reload()
-// directly so they never rely on watch timing.
+// fixture dir itself) and mutates the copy. The raw fixtures are a
+// lineage-linked trio sharing vol-2c4f1a; a small clean baseline drops the
+// worktree child and de-aliases payments-repo (distinct fingerprint, no
+// parent). Watcher-driven tests poll with a deadline instead of a fixed
+// sleep; deterministic cases call reload() directly so they never rely on
+// watch timing.
 
 import { describe, it, expect, afterEach } from "vitest";
 import { cpSync, mkdtempSync, mkdirSync, rmSync, writeFileSync, readFileSync } from "node:fs";
@@ -42,13 +45,32 @@ afterEach(() => {
 });
 
 /**
- * The fixture pair (payments-repo + workstation-repos) shares fingerprint
- * vol-2c4f1a with no lineage — it is an aliasing pair. A *good* baseline
- * breaks the collision by giving payments-repo a distinct fingerprint.
+ * The raw fixtures are a lineage-linked trio (workstation-repos ←
+ * payments-repo ← payments-repo-feat-x, all sharing vol-2c4f1a) that loads
+ * cleanly. A *good* two-document baseline for tests that need a small,
+ * current set: drop the worktree child, give payments-repo a distinct
+ * fingerprint, and strip its parent link. Never mutate a lineaged child's
+ * fingerprint — that breaks lineage; aliasing is synthesized by breaking
+ * the parent's link.
  */
-function goodBaseline(dir: string): void {
+function tempBaseline(dir: string): void {
+  rmSync(join(dir, "Workspace", "payments-repo-feat-x.yaml"), { force: true });
   const p = join(dir, "Workspace", "payments-repo.yaml");
-  writeFileSync(p, readFileSync(p, "utf8").replace("vol-2c4f1a", "vol-payments-01"));
+  writeFileSync(
+    p,
+    readFileSync(p, "utf8")
+      .replace("vol-2c4f1a", "vol-payments-01")
+      .replace("  parent: { kind: Workspace, name: workstation-repos }\n", ""),
+  );
+}
+
+/** Synthesize an aliasing set: strip payments-repo's parent link only. */
+function breakLineage(dir: string): void {
+  const p = join(dir, "Workspace", "payments-repo.yaml");
+  writeFileSync(
+    p,
+    readFileSync(p, "utf8").replace("  parent: { kind: Workspace, name: workstation-repos }\n", ""),
+  );
 }
 
 /** An unrelated Workspace root with the given (colliding) fingerprint. */
@@ -92,7 +114,7 @@ function snapshotStore(snap: Snapshot, statusCache: ResolveStore["statusCache"])
 
 describe("RegistryStore", () => {
   it("initial load of a good set: current health, 2 documents, generation 1", () => {
-    const dir = tempDocuments(goodBaseline);
+    const dir = tempDocuments(tempBaseline);
     const store = startStore(dir);
 
     expect(store.health()).toEqual({ documentSet: "current", warnings: [] });
@@ -110,7 +132,7 @@ describe("RegistryStore", () => {
   });
 
   it("watcher-driven aliasing append: rejected reload keeps serving the last-good snapshot", async () => {
-    const dir = tempDocuments(goodBaseline);
+    const dir = tempDocuments(tempBaseline);
     const store = startStore(dir);
 
     // Append an unrelated root colliding on workstation-repos' fingerprint.
@@ -130,7 +152,7 @@ describe("RegistryStore", () => {
   });
 
   it("fixing the colliding file returns the store to current with an incremented generation", async () => {
-    const dir = tempDocuments(goodBaseline);
+    const dir = tempDocuments(tempBaseline);
     const store = startStore(dir);
 
     writeWorkspace(dir, "cluster-repos", "ws_cluster-repos", "vol-2c4f1a");
@@ -151,8 +173,10 @@ describe("RegistryStore", () => {
   });
 
   it("cold start on a rejected set: empty snapshot, stale health, logged; recovers on reload", () => {
-    // The raw fixtures are already an aliasing pair (shared fingerprint, no lineage).
-    const dir = tempDocuments();
+    // Raw fixtures load cleanly (lineage-linked trio); synthesize aliasing
+    // by stripping payments-repo's parent link — the trio then shares
+    // vol-2c4f1a with no lineage between workstation-repos and the payments line.
+    const dir = tempDocuments(breakLineage);
     const store = startStore(dir);
 
     const health = store.health();
@@ -167,16 +191,17 @@ describe("RegistryStore", () => {
     expect(snap.generation).toBe(0);
     expect(store.get("Workspace", "payments-repo")).toBeUndefined();
 
-    // Recovery via a direct reload (watch timing not relied on).
-    goodBaseline(dir);
+    // Recovery via a direct reload (watch timing not relied on): restore the
+    // lineaged fixture file.
+    cpSync(join(fixtures, "Workspace", "payments-repo.yaml"), join(dir, "Workspace", "payments-repo.yaml"));
     store.reload();
     expect(store.health().documentSet).toBe("current");
-    expect(store.current().documents).toHaveLength(2);
+    expect(store.current().documents).toHaveLength(3);
     expect(store.current().generation).toBe(1);
   });
 
   it("a snapshot held across a bad reload is a stable world (Review Focus #4)", () => {
-    const dir = tempDocuments(goodBaseline);
+    const dir = tempDocuments(tempBaseline);
     const store = startStore(dir);
 
     // Pre-check: the store itself satisfies ResolveStore.
@@ -210,7 +235,7 @@ describe("RegistryStore", () => {
   });
 
   it("close() stops watchers and timers: idempotent, and no reloads fire afterwards", async () => {
-    const dir = tempDocuments(goodBaseline);
+    const dir = tempDocuments(tempBaseline);
     const store = startStore(dir);
 
     store.close();

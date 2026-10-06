@@ -43,11 +43,15 @@ status: {}
 }
 
 describe("loadDirectory", () => {
-  it("loads both fixture documents as resolvable with correct durable ids", () => {
+  it("loads all three fixture documents as resolvable with correct durable ids", () => {
     const { documents, problems } = loadDirectory(fixtures);
     expect(problems).toEqual([]);
-    expect(documents).toHaveLength(2);
-    expect(documents.map((d) => d.name).sort()).toEqual(["payments-repo", "workstation-repos"]);
+    expect(documents).toHaveLength(3);
+    expect(documents.map((d) => d.name).sort()).toEqual([
+      "payments-repo",
+      "payments-repo-feat-x",
+      "workstation-repos",
+    ]);
 
     for (const doc of documents) {
       expect(doc.resolvable).toBe(true);
@@ -67,6 +71,11 @@ describe("loadDirectory", () => {
 
     const pay = documents.find((d) => d.name === "payments-repo")!;
     expect(durableIdOf(pay)).toBe("ws_01J8Z4-payments-repo");
+
+    // The §2.2 worktree child: shares the parent's fingerprint via lineage.
+    const child = documents.find((d) => d.name === "payments-repo-feat-x")!;
+    expect(durableIdOf(child)).toBe("ws_01J8Z4-payments-repo-feat-x");
+    expect(child.parent).toEqual({ kind: "Workspace", name: "payments-repo" });
   });
 
   it("skips non-YAML entries and foreign subdirectories with problems, never crashing (flat file loads)", () => {

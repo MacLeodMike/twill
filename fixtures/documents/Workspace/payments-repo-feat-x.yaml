@@ -1,0 +1,17 @@
+apiVersion: twill.bitwiseoperations.ca/v1alpha1
+kind: Workspace
+metadata: { name: payments-repo-feat-x, labels: { twill/workspace-class: git } }
+spec:
+  owner: user:example
+  routes:
+    - match: {agentLocation: workstation}
+      type: local
+      path: ~/repos/payments-repo/wt/feat-x
+  workspace:
+    storageBacked: true
+    accessMode: RWO
+    storage:
+      id: ws_01J8Z4-payments-repo-feat-x
+      fingerprint: vol-2c4f1a
+  parent: { kind: Workspace, name: payments-repo }
+status: {}

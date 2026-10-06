@@ -3,8 +3,10 @@
 //
 // Each test boots createServer(store).listen(0) against a fixture-backed
 // temp-dir store (never the fixture dir itself) and speaks plain `fetch`.
-// The fixture pair is an aliasing pair, so every boot applies the same
-// one-line fingerprint mutation as Task 5's `goodBaseline` before start().
+// The raw fixtures are a lineage-linked trio sharing vol-2c4f1a, so every
+// boot applies the same baseline mutation as Task 5's `tempBaseline` before
+// start(): drop the worktree child, de-alias payments-repo (distinct
+// fingerprint, parent link stripped).
 // Servers, stores, and temp dirs are closed/removed in afterEach so
 // vitest exits cleanly.
 
@@ -30,9 +32,17 @@ type Boot = { base: string; store: RegistryStore };
 async function boot(mutate?: (dir: string) => void): Promise<Boot> {
   const dir = mkdtempSync(join(tmpdir(), "twill-http-"));
   cpSync(fixtures, dir, { recursive: true });
-  // Good baseline: break the fixture pair's fingerprint aliasing.
+  // Good baseline: drop the worktree child, de-alias payments-repo (distinct
+  // fingerprint, parent link stripped). Never mutate a lineaged child's
+  // fingerprint.
+  rmSync(join(dir, "Workspace", "payments-repo-feat-x.yaml"), { force: true });
   const p = join(dir, "Workspace", "payments-repo.yaml");
-  writeFileSync(p, readFileSync(p, "utf8").replace("vol-2c4f1a", "vol-payments-01"));
+  writeFileSync(
+    p,
+    readFileSync(p, "utf8")
+      .replace("vol-2c4f1a", "vol-payments-01")
+      .replace("  parent: { kind: Workspace, name: workstation-repos }\n", ""),
+  );
   mutate?.(dir);
   tempDirs.push(dir);
 

@@ -16,4 +16,5 @@ spec:
     hostname: workstation
     toolHints: [git, forgejo-api, pi]
     shellPolicy: full
+  parent: { kind: Workspace, name: workstation-repos }
 status: {}

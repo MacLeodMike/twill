@@ -1,0 +1,15 @@
+services:
+  twill-registry:
+    build: ..
+    volumes:
+      - ../fixtures/documents:/documents:ro
+    ports:
+      - "8080:8080"
+    restart: unless-stopped
+  # Optional tier-2 provider (workspace §9.1): uncomment to POST
+  # statusReport {ready: true} per workspace every 30s so the status
+  # surface is truthful rather than the never-observed default.
+  # twill-static-provider:
+  #   build: ../providers/static
+  #   environment: { TWILL_REGISTRY: "http://twill-registry:8080" }
+  #   restart: unless-stopped

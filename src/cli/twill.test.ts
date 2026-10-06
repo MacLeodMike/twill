@@ -35,7 +35,9 @@ let registry: string;
 beforeAll(async () => {
   dir = mkdtempSync(join(tmpdir(), "twill-cli-"));
   cpSync(fixtures, dir, { recursive: true });
-  // Good baseline: break the fixture pair's fingerprint aliasing.
+  // Good baseline: drop the lineage-linked worktree child and break the
+  // fixture pair's fingerprint aliasing.
+  rmSync(join(dir, "Workspace", "payments-repo-feat-x.yaml"), { force: true });
   const p = join(dir, "Workspace", "payments-repo.yaml");
   writeFileSync(p, readFileSync(p, "utf8").replace("vol-2c4f1a", "vol-payments-01"));
 

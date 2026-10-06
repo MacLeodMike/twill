@@ -7,6 +7,7 @@
     "node": ">=22"
   },
   "scripts": {
+    "start": "tsx src/registry/server.ts",
     "test": "vitest run",
     "dev": "tsx watch src/registry/server.ts",
     "cli": "tsx src/cli/twill.ts"
