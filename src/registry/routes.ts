@@ -12,6 +12,7 @@ import type { IncomingMessage, ServerResponse } from "node:http";
 import { KINDS, durableIdOf, isRecord, type FabricDocument, type Kind } from "./document.js";
 import { resolve, type Consumer } from "./resolver.js";
 import { documentKey } from "./lineage.js";
+import { validateClaimCreate } from "./claims.js";
 import type { RegistryStore } from "./store.js";
 import { neverObservedDefault, type StatusCache, type StatusSurface } from "./status.js";
 
@@ -20,9 +21,12 @@ export type RouteError = { httpStatus: 400 | 404; error: string };
 
 export type HttpStatus =
   | 200 // success
+  | 201 // claim created (T2a)
   | 400 // malformed body / missing or ill-typed fields
   | 404 // unknown path or absent document
-  | 501; // T1-deferred surface (claims, overlay)
+  | 409 // claim conflicts: existing Claim name, missing parent (T2a)
+  | 422 // claimedOn inconsistent with the parent document (T2a, §8.4)
+  | 501; // T1-deferred surface (claim PATCH/GET paths, overlay)
 
 /** The T1-deferred bodies (Global Constraints + workspace §8). */
 export const CLAIMS_UNIMPLEMENTED = {
@@ -86,19 +90,33 @@ export function route(store: RegistryStore, req: IncomingMessage, res: ServerRes
     respond(res, 200, store.health());
     return;
   }
-  // /Claim/<name>: the claim surface is T1-deferred for the pinned claim
-  // methods (GET/POST/PATCH) — no Claim document can exist in T1 (creation
-  // is 501), so a GET here can never legitimately succeed; 501 is the
-  // truthful answer. Any other method falls through to the generic
-  // method-not-supported 404 below.
-  if (
-    first === "Claim" &&
-    second !== undefined &&
-    third === undefined &&
-    (method === "GET" || method === "POST" || method === "PATCH")
-  ) {
-    respond(res, 501, CLAIMS_UNIMPLEMENTED);
-    return;
+  // /Claim/<name>: POST creates the claim (T2a); GET and PATCH stay
+  // T1-deferred (PATCH releases land in Task 2, GET /claims in Task 5).
+  // Any other method falls through to the generic method-not-supported
+  // 404 below.
+  if (first === "Claim" && second !== undefined && third === undefined) {
+    if (method === "POST") {
+      readJsonBody(req, res, (body) => {
+        const checked = validateClaimCreate(body, second, store);
+        if (!checked.ok) {
+          respond(res, checked.status, { error: checked.error });
+          return;
+        }
+        const appended = store.appendOverlay(checked.doc);
+        if (!appended.ok) {
+          // Write-time merged-set validation (workspace §8): the write whose
+          // merged result would violate §8.3 is refused, never persisted.
+          respond(res, 409, { error: appended.error ?? "merged document set rejected" });
+          return;
+        }
+        respond(res, 201, checked.doc.raw);
+      });
+      return;
+    }
+    if (method === "GET" || method === "PATCH") {
+      respond(res, 501, CLAIMS_UNIMPLEMENTED);
+      return;
+    }
   }
   // Unknown top-level segment: only kinds may appear there. Reserved
   // words (resolve/health/claims) arriving here used a wrong method/shape;

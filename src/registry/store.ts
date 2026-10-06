@@ -2,12 +2,21 @@
 // semantics, and the last-good snapshot protocol (core §8.3 + workspace §8).
 //
 // The snapshot is the consistency unit: a reload builds the new snapshot
-// completely (loadDirectory → rejectCheck) and swaps it in with a single
-// assignment, so a resolver holding an old Snapshot object sees a stable
-// world across reloads (Review Focus #4). A *rejected* reload swaps nothing —
-// the last-good snapshot keeps being served and health() reports
-// `documentSet: "stale"` with the reject reason. A cold start on a rejected
-// set serves an empty snapshot (generation 0), also `stale`.
+// completely (loadDirectory → rejectCheck → overlay merge) and swaps it in
+// with a single assignment, so a resolver holding an old Snapshot object
+// sees a stable world across reloads (Review Focus #4). A *rejected* reload
+// swaps nothing — the last-good snapshot keeps being served and health()
+// reports `documentSet: "stale"` with the reject reason. A cold start on a
+// rejected set serves an empty snapshot (generation 0), also `stale`.
+//
+// The writable overlay (workspace §8): API-written documents (Claims in
+// T2a) live in `overlay`, an in-memory Map keyed on `"<Kind>/<name>"` that
+// `appendOverlay` writes through — every append validates the merged set
+// (watched ∪ overlay ∪ new) with rejectCheck *before* writing, so one bad
+// write cannot poison every subsequent reload. The merged snapshot is the
+// union with the overlay winning on name collision (§8.3's document set
+// means the union). File persistence lands in Task 3 behind this same
+// seam; the merge semantics here are already the final ones.
 //
 // RegistryStore satisfies the resolver's ResolveStore interface:
 // `get(kind, name)` answers from the current snapshot and `statusCache` is
@@ -63,6 +72,13 @@ export class RegistryStore {
   private closed = false;
   private readonly dir: string;
 
+  /**
+   * The writable overlay (workspace §8): API-written documents, keyed on
+   * `"<Kind>/<name>"`, merged over the watched set on every accepted
+   * (re)load. In-memory in T2a Task 1; Task 3 persists it behind this seam.
+   */
+  private readonly overlay = new Map<string, FabricDocument>();
+
   /** Prefer `start(dir)` — the conventional entry that documents cold-start semantics. */
   constructor(dir: string) {
     this.dir = dir;
@@ -105,7 +121,11 @@ export class RegistryStore {
     const { documents, problems } = loadDirectory(this.dir);
     this.problems.splice(0, this.problems.length, ...problems);
 
-    const rejection = rejectCheck(documents);
+    // The overlay merges over the watched set (workspace §8: the document
+    // set is watched ∪ overlay, overlay wins on name collision) and the
+    // merged set is what gets reject-checked — §8.3's set means the union.
+    const merged = mergeOverlay(documents, this.overlay);
+    const rejection = rejectCheck(merged);
     if (rejection.rejected) {
       const rejectedAt = new Date().toISOString();
       // eslint-disable-next-line no-console
@@ -118,12 +138,28 @@ export class RegistryStore {
       return;
     }
 
-    const byName = new Map<string, FabricDocument>();
-    for (const doc of documents) byName.set(documentKey(doc), doc);
-
     // The snapshot is the atomicity unit: built fully, then a single swap.
-    this.snapshot = { documents, byName, generation: this.snapshot.generation + 1 };
+    this.snapshot = buildSnapshot(merged, this.snapshot.generation + 1);
     this.report = { documentSet: "current", warnings: [] };
+  }
+
+  /**
+   * The overlay write seam (workspace §8): validate the merged set
+   * (watched ∪ overlay ∪ `doc`, overlay winning on name collision) through
+   * rejectCheck *before* appending; on violation return the error and
+   * change nothing. On success the merged snapshot is rebuilt and swapped
+   * in a single assignment (generation increments), so resolution and
+   * discovery see the document immediately.
+   */
+  appendOverlay(doc: FabricDocument): { ok: boolean; error?: string } {
+    const merged = mergeOverlay(this.snapshot.documents, this.overlay, doc);
+    const rejection = rejectCheck(merged);
+    if (rejection.rejected) {
+      return { ok: false, error: rejection.reason ?? "merged document set rejected" };
+    }
+    this.overlay.set(documentKey(doc), doc);
+    this.snapshot = buildSnapshot(merged, this.snapshot.generation + 1);
+    return { ok: true };
   }
 
   /** Stop watchers and any pending debounce; the store becomes inert. */
@@ -180,6 +216,27 @@ export class RegistryStore {
       }
     }
   }
+}
+
+/** The union watched ∪ overlay (∪ an optional pending doc): later entries
+ * win on `"<Kind>/<name>"` collision (workspace §8: overlay wins). */
+function mergeOverlay(
+  watched: readonly FabricDocument[],
+  overlay: ReadonlyMap<string, FabricDocument>,
+  pending?: FabricDocument,
+): FabricDocument[] {
+  const merged = new Map<string, FabricDocument>();
+  for (const doc of watched) merged.set(documentKey(doc), doc);
+  for (const [key, doc] of overlay) merged.set(key, doc);
+  if (pending !== undefined) merged.set(documentKey(pending), pending);
+  return [...merged.values()];
+}
+
+/** A snapshot over a merged document list (union already computed). */
+function buildSnapshot(documents: FabricDocument[], generation: number): Snapshot {
+  const byName = new Map<string, FabricDocument>();
+  for (const doc of documents) byName.set(documentKey(doc), doc);
+  return { documents, byName, generation };
 }
 
 /** Was the recursive watch rejected for the platform (not our path being bad)? */

@@ -287,12 +287,12 @@ describe("(f) POST statusReport then resolve — the descriptor reflects the rep
   });
 });
 
-describe("(g) claims surface — 501 with the T2 milestone message", () => {
-  it("POST /Claim/<name> → 501 {claims unimplemented in T1 milestone, milestone: T2}", async () => {
+describe("(g) claims surface — POST creates (T2a); the other claim methods keep the T1 501", () => {
+  it("POST /Claim/<name> → 400 on a malformed body (shape checks precede parent lookup; the full create contract lives in claims.test.ts)", async () => {
     const { base } = await boot();
     const res = await post(base, "/Claim/x", { spec: { claim: { principal: "user:test" } } });
-    expect(res.status).toBe(501);
-    expect(await res.json()).toEqual({ error: "claims unimplemented in T1 milestone", milestone: "T2" });
+    expect(res.status).toBe(400);
+    expect(((await res.json()) as { error: string }).error).toContain("apiVersion");
   });
 
   it("PATCH /Claim/<name> → the same 501", async () => {
