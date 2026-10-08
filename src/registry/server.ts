@@ -8,7 +8,7 @@ import { createServer as httpCreateServer, type Server } from "node:http";
 import { start, type RegistryStore } from "./store.js";
 import { route } from "./routes.js";
 
-export { API_PREFIX, CLAIMS_UNIMPLEMENTED, OVERLAY_UNIMPLEMENTED } from "./routes.js";
+export { API_PREFIX, CLAIMS_UNIMPLEMENTED } from "./routes.js";
 
 /** The registry's HTTP surface over an already-started store. */
 export function createServer(store: RegistryStore): Server {

@@ -7,10 +7,11 @@
 // (`/twill/v1alpha1/Workspace/<name>`). Unknown paths → 404.
 
 import type { IncomingMessage, ServerResponse } from "node:http";
-import { KINDS, durableIdOf, isRecord, type FabricDocument, type Kind } from "./document.js";
+import { API_VERSION, KINDS, durableIdOf, isRecord, type FabricDocument, type Kind } from "./document.js";
 import { resolve, type Consumer } from "./resolver.js";
 import { documentKey } from "./lineage.js";
 import { validateClaimCreate, validateClaimRelease } from "./claims.js";
+import { projectDocument } from "./loader.js";
 import type { RegistryStore } from "./store.js";
 import { neverObservedDefault, type StatusCache, type StatusSurface } from "./status.js";
 
@@ -18,22 +19,19 @@ import { neverObservedDefault, type StatusCache, type StatusSurface } from "./st
 export type RouteError = { httpStatus: 400 | 404; error: string };
 
 export type HttpStatus =
-  | 200 // success (incl. claim release + idempotent re-release, T2a)
+  | 200 // success (incl. claim release + idempotent re-release, T2a; overlay upsert, t25)
   | 201 // claim created (T2a)
-  | 400 // malformed body / missing or ill-typed fields (incl. GET /claims without `parent`)
+  | 400 // malformed body / missing or ill-typed fields (incl. GET /claims without `parent`; PATCH envelope/kind/name mismatch, t25)
   | 404 // unknown path or absent document (PATCH on a missing claim, T2a; POST /claims plural)
-  | 409 // claim conflicts: existing Claim name, missing parent, PATCH mutating beyond release (T2a)
+  | 409 // claim conflicts: existing Claim name, missing parent, PATCH mutating beyond release (T2a); upsert §8.3 rejections (t25)
   | 422 // claimedOn inconsistent with the parent document (T2a, §8.4)
   | 500 // internal fault (e.g. the overlay write failing — readJsonBody's last-resort guard)
-  | 501; // T1-deferred surface (GET /Claim/<name>; the overlay PATCH)
+  | 501; // T1-deferred surface (GET /Claim/<name>)
 
-/** The T1-deferred bodies (Global Constraints + workspace §8). */
+/** The T1-deferred body (Global Constraints + workspace §8). */
 export const CLAIMS_UNIMPLEMENTED = {
   error: "claims unimplemented in T1 milestone",
   milestone: "T2",
-} as const;
-export const OVERLAY_UNIMPLEMENTED = {
-  error: "overlay writes unimplemented in T1 milestone",
 } as const;
 
 /** The `/twill/v1alpha1` prefix every route lives under (workspace §8). */
@@ -174,7 +172,8 @@ export function route(store: RegistryStore, req: IncomingMessage, res: ServerRes
 
   const kind = first as Kind;
 
-  // /<Kind>/<name> — GET the document, PATCH the (deferred) overlay.
+  // /<Kind>/<name> — GET the document, PATCH the overlay upsert (t25
+  // Task 1: non-Claim kinds; Claim PATCH is the release-only path above).
   if (second !== undefined && third === undefined) {
     if (method === "GET") {
       const doc = store.get(kind, second);
@@ -188,7 +187,23 @@ export function route(store: RegistryStore, req: IncomingMessage, res: ServerRes
       return;
     }
     if (method === "PATCH") {
-      respond(res, 501, OVERLAY_UNIMPLEMENTED);
+      readJsonBody(req, res, (body) => {
+        const checked = upsertBody(kind, second, body);
+        if ("error" in checked) {
+          respond(res, checked.httpStatus, { error: checked.error });
+          return;
+        }
+        const appended = store.appendOverlay(checked.doc);
+        if (!appended.ok) {
+          // Write-time merged-set validation (workspace §8): a write whose
+          // merged result would violate §8.3 (fingerprint collision without
+          // lineage, duplicate durable id, parent cycle) is refused, never
+          // persisted — one bad PATCH cannot poison every subsequent reload.
+          respond(res, 409, { error: appended.error ?? "merged document set rejected" });
+          return;
+        }
+        respond(res, 200, checked.doc.raw);
+      });
       return;
     }
     respond(res, 404, { error: `method ${method} not supported on /<kind>/<name>` });
@@ -258,6 +273,48 @@ function resolveBody(
     };
   }
   return { kind: kind as Kind, name, consumer: { agentLocation, agentKind, principal } };
+}
+
+/**
+ * The overlay-upsert body (t25 Task 1, workspace §8): a non-Claim document
+ * envelope addressed by the URL. `kind`/`urlName` come from the path — the
+ * body's declared `kind` must equal the URL kind and its `metadata.name`
+ * must equal the URL name (both mismatches are 400s). The body is JSON
+ * (the claims write surfaces are JSON too; the registry serves YAML only
+ * from the watched source) and the parsed envelope is stored VERBATIM as
+ * the overlay line — doc.raw round-trips byte-identically, the same rule
+ * GET /<kind>/<name> serves under (Pin 5).
+ *
+ * Envelope checks are the overlay's trust-model minimum (kind, name,
+ * apiVersion): the upsert does NOT re-run the watched loader's inert
+ * marking (a provider-written document is trusted as appended, like an
+ * overlay line at load — overlay.ts). Upsert semantics are the store's:
+ * a PATCH against a not-yet-existing name creates the document, and
+ * latest-per-name replaces. §8.3 set validation is appendOverlay's job.
+ */
+function upsertBody(kind: Kind, urlName: string, body: unknown): { doc: FabricDocument } | RouteError {
+  if (!isRecord(body)) return { httpStatus: 400, error: "PATCH body must be a JSON object (a document envelope)" };
+  if (body["apiVersion"] !== API_VERSION) {
+    return { httpStatus: 400, error: `apiVersion must be ${API_VERSION}` };
+  }
+  if (body["kind"] !== kind) {
+    return {
+      httpStatus: 400,
+      error: `kind must be ${kind} (the URL kind; got ${JSON.stringify(body["kind"])})`,
+    };
+  }
+  const metadata = isRecord(body["metadata"]) ? body["metadata"] : undefined;
+  const name = metadata?.["name"];
+  if (typeof name !== "string" || name === "") {
+    return { httpStatus: 400, error: "metadata.name is required (non-empty string)" };
+  }
+  if (name !== urlName) {
+    return {
+      httpStatus: 400,
+      error: `metadata.name ${JSON.stringify(name)} does not match the URL name ${JSON.stringify(urlName)}`,
+    };
+  }
+  return { doc: projectDocument(body, "<overlay>") };
 }
 
 /**

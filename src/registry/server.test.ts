@@ -340,16 +340,16 @@ describe("(g) claims surface — POST creates + PATCH releases (T2a); the single
   });
 });
 
-describe("PATCH /<kind>/<name> (non-Claim) — overlay 501", () => {
-  it("501s with the overlay message", async () => {
+describe("PATCH /<kind>/<name> (non-Claim) — the overlay upsert (t25 Task 1)", () => {
+  it("400s on a malformed envelope (the full upsert contract lives in upsert.test.ts)", async () => {
     const { base } = await boot();
     const res = await fetch(`${base}/Workspace/workstation-repos`, {
       method: "PATCH",
       headers: { "content-type": "application/json" },
       body: JSON.stringify({}),
     });
-    expect(res.status).toBe(501);
-    expect(await res.json()).toEqual({ error: "overlay writes unimplemented in T1 milestone" });
+    expect(res.status).toBe(400);
+    expect(((await res.json()) as { error: string }).error).toContain("apiVersion");
   });
 });
 

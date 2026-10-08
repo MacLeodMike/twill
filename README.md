@@ -88,5 +88,9 @@ status reports.
 ## Scope notes
 
 Workspaces are the only registered kind-runner; other kinds load inert.
-Provider-authored child documents (the overlay PATCH for non-Claim kinds) are
-deferred to T2b and still answer HTTP 501.
+`PATCH /twill/v1alpha1/<kind>/<name>` upserts provider-authored documents
+(child Workspaces included) into the writable overlay: the body is the full
+document envelope as JSON, the URL kind/name must match the envelope, and a
+write whose merged result would violate §8.3 (fingerprint collision without
+lineage, duplicate durable id, parent cycle) is rejected 409 and never
+persisted. Claim PATCH stays release-only.
