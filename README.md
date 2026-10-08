@@ -94,3 +94,88 @@ document envelope as JSON, the URL kind/name must match the envelope, and a
 write whose merged result would violate §8.3 (fingerprint collision without
 lineage, duplicate durable id, parent cycle) is rejected 409 and never
 persisted. Claim PATCH stays release-only.
+
+## The provider (the fabric's third party)
+
+The registry is the menu; the consumer attaches. The **provider** is the third
+party that *materializes* — it owns workspaces, runs their preconditions, and
+reports state. Without one, a claim against a cold workspace is never answered.
+The localhost provider here is the reference implementation: it polls the
+registry for claims, materializes them with local `git`, and reports back — all
+over HTTP, the same bytes any third-party provider exchanges.
+
+### `twill provider --config <file>`
+
+Runs a provider against a config file (YAML, or JSON as its subset):
+
+```yaml
+registry: http://localhost:8080      # the /twill/v1alpha1 prefix is added when absent
+pollIntervalMs: 5000                  # optional, default 5000
+parents: [workstation-repos]          # the parent workspaces this provider polls
+routes:                               # the verbatim route objects this provider owns
+  - match: { agentLocation: workstation }
+    type: local
+    path: ~/repos/workstation-repos
+    precondition:
+      steps:
+        - { type: gitClone, url: git@example:me/repo.git, ref: main }
+```
+
+The provider owns exactly the routes it's configured with. A claim carries a
+verbatim copy of the route it resolved against (`spec.claim.route`); the
+provider fulfills a claim only when that route **deep-equals** one of its own
+`routes` — so two providers backing one fingerprint never both materialize, and
+a claim for a route the provider doesn't own is ignored (no materialization, no
+statusReport).
+
+For each owned claim it polls on a parent, the loop:
+
+1. reports the parent `ready: false` (`provisioning …`),
+2. runs the route's `precondition.steps[]`, substituting the claim's
+   `parameters` (`{{claim.parameters.branch}}`, `{{claim.parameters.worktreeName}}`),
+3. on success, PATCHes the deterministic child document into the overlay
+   (`<parent>-<worktreeName>`; child `storage.id` is the parent's id suffixed
+   with the worktree name, so a duplicate claim converges rather than
+   duplicating) and reports the child `ready: true`,
+4. restores the parent's own state; on failure reports `ready: false` with the
+   reason and writes no child.
+
+A claim with no `worktreeName` is a **cold-root** claim: the parent itself is
+materialized and reported ready, with no child document.
+
+v1 implements the two local precondition steps, `gitClone` and `worktree`;
+`pvcBind` / `remoteMkdir` / `mountCheck` (cluster shapes) are rejected — the
+claim fails with a progress note naming the unsupported step rather than
+half-materializing. The provider is HTTP-only to the registry (it never touches
+the store directly) and single-process (no cross-process locking); claims on
+one parent are fulfilled serially, distinct parents concurrently.
+
+### Embedding (the homelab one-install story)
+
+`startProvider` is importable, so a consumer runtime can host the loop
+in-process instead of running a separate daemon — `twill-pi` embeds it so the
+homelab user who installs the pi extension gets a registry *and* a provider
+from one install:
+
+```ts
+import { startProvider } from "twill/src/provider/loop.js";
+
+const handle = startProvider({
+  registry: "http://localhost:8080",
+  parents: ["workstation-repos"],
+  routes: [/* the verbatim route objects this provider owns */],
+  pollIntervalMs: 5000,        // optional
+  onEvent: (line) => log(line) // optional lifecycle observer (one line per event)
+});
+// …later, on shutdown:
+handle.stop();
+```
+
+The `ProviderConfig` field names are the wire shape an embedder constructs;
+`onEvent` receives one self-describing, timestamped line per poll-observed
+event (fulfilled / failed / ignored / skipped).
+
+Known gaps, honestly: the provider stops on SIGINT only (no SIGTERM handler —
+the cluster milestone's concern), there's no provider discovery yet (the
+binding is configured, per the spec), and a long-lived un-released claim's
+skip/ignore log line repeats every poll (steady-state noise, to be demoted).
