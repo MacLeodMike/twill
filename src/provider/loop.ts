@@ -48,6 +48,11 @@
 
 import { homedir } from "node:os";
 import { type Route } from "../registry/document.js";
+
+// The provider's public surface (the `./provider` export) references Route in
+// ProviderConfig.routes, so re-export it — one spelling of the wire type,
+// owned here, so consumers never re-declare the protocol type locally.
+export type { Route } from "../registry/document.js";
 import { buildChildDocument, childNameFor, type ClaimEnvelope } from "./child.js";
 import { isMine } from "./match.js";
 import { runPrecondition, type PreconditionStep } from "./preconditions.js";
