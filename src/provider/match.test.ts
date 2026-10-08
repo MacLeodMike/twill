@@ -54,6 +54,27 @@ describe("isMine — deep-equal route binding", () => {
     expect(isMine(route(), [])).toBe(false);
   });
 
+  it("precondition step order is significant: [A,B] does not match [B,A]", () => {
+    // Arrays compare element-wise (JSON semantics): the steps array is an
+    // ORDERED execution plan, so a route whose steps are [A,B] binds only
+    // to the identical order. Pin this so a future "normalization" pass
+    // cannot silently reorder the binding.
+    const stepsAB = {
+      steps: [
+        { type: "gitClone", url: "git@x", ref: "main" },
+        { type: "worktree", repo: "r", branch: "b" },
+      ],
+    };
+    const stepsBA = {
+      steps: [
+        { type: "worktree", repo: "r", branch: "b" },
+        { type: "gitClone", url: "git@x", ref: "main" },
+      ],
+    };
+    expect(isMine(route({ precondition: stepsAB }), [route({ precondition: stepsBA })])).toBe(false);
+    expect(isMine(route({ precondition: stepsBA }), [route({ precondition: stepsAB })])).toBe(false);
+  });
+
   it("a route without match/precondition only equals the same minimal shape", () => {
     const minimal: Route = { type: "local", path: "/p" };
     expect(isMine({ type: "local", path: "/p" }, [minimal])).toBe(true);

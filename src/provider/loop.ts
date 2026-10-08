@@ -34,9 +34,11 @@
 // Placement root: the claim route's own `path` (the verbatim parent route —
 // workspace §6.2: claims name the resolved route verbatim). Materialized
 // clones/worktrees live at <route.path>/.twill/<parent-name>/…, derived
-// from the parent workspace itself. A configured route without a string
-// `path` (an `ssh` route) can never match as a local claim target: its
-// claims fail with progress naming the missing path.
+// from the parent workspace itself. Only a `type: "local"` route may be a
+// local claim target: a misconfigured non-local route (e.g. `ssh`) that
+// carries a `path` fails loud with progress naming the route type (T25-3
+// review) — never materialized locally at the remote path; a route without
+// a string `path` fails with progress naming the missing path.
 //
 // Placement-path sanitization (T25-2 review, carried into Task 3): the
 // worktreeName is validated before ANY materialization or status write —
@@ -142,13 +144,28 @@ function claimRoute(claim: ClaimEnvelope): Route | undefined {
 
 /**
  * The materialization root for claims against `parentName` served by
- * `route`: <route.path>/.twill/<parentName>. Undefined when the route has
- * no usable local path.
+ * `route`: <route.path>/.twill/<parentName>. The local-route guard (T25-3
+ * review): only `type: "local"` may be materialized locally — a
+ * misconfigured non-local route (e.g. `ssh`) carrying a `path` fails loud
+ * with a reason naming the route type, never materializes at the remote
+ * path. A route without a string `path` fails naming the missing path.
  */
-function workDirFor(route: Route, parentName: string): string | undefined {
+function workDirFor(
+  route: Route,
+  parentName: string,
+): { ok: true; workDir: string } | { ok: false; reason: string } {
+  const type = route["type"];
+  if (type !== "local") {
+    return {
+      ok: false,
+      reason: `claim route type ${JSON.stringify(type)} is not local — refusing to materialize it at a local path`,
+    };
+  }
   const raw = route["path"];
-  if (typeof raw !== "string" || raw === "") return undefined;
-  return `${expandPath(raw).replace(/\/+$/, "")}/.twill/${parentName}`;
+  if (typeof raw !== "string" || raw === "") {
+    return { ok: false, reason: `claim route has no local path to materialize into` };
+  }
+  return { ok: true, workDir: `${expandPath(raw).replace(/\/+$/, "")}/.twill/${parentName}` };
 }
 
 /** The precondition steps of a route (workspace §7's `precondition.steps[]`). */
@@ -333,15 +350,21 @@ export function startProvider(config: ProviderConfig): ProviderHandle {
     // parent itself (run the claim route's steps), report ready on the
     // parent, NO child.
     if (worktreeName === undefined) {
-      const workDir = workDirFor(route, parentName);
-      if (workDir === undefined) {
-        await report("Workspace", parentName, {
-          ready: false,
-          progress: `claim route has no local path to materialize into`,
-        });
+      // Idempotence (spec §6), symmetric with the worktree path's childReady
+      // skip: an already-fulfilled cold-root claim (parent already ready) is
+      // a no-op — no re-running the parent's steps (a gitClone re-run still
+      // fetches + rev-parses every poll), no re-reporting. Without the skip,
+      // a transient origin outage flips the ALREADY-fulfilled parent to
+      // ready:false on the re-run's fetch error — consumer-visible flapping.
+      // Retry-on-failure is preserved: ready is false after a failed
+      // attempt, so the next poll re-runs the steps.
+      if ((await parentStatus(parentName, consumer)).ready === true) return;
+      const dir = workDirFor(route, parentName);
+      if (!dir.ok) {
+        await report("Workspace", parentName, { ready: false, progress: dir.reason });
         return;
       }
-      const ran = await runSteps(preconditionSteps(route), { claimParameters: parameters, workDir });
+      const ran = await runSteps(preconditionSteps(route), { claimParameters: parameters, workDir: dir.workDir });
       if (!ran.ok) {
         await report("Workspace", parentName, { ready: false, progress: ran.error });
         return;
@@ -364,12 +387,9 @@ export function startProvider(config: ProviderConfig): ProviderHandle {
     // ready — is a no-op.
     if (await childReady(childName, consumer)) return;
 
-    const workDir = workDirFor(route, parentName);
-    if (workDir === undefined) {
-      await report("Workspace", parentName, {
-        ready: false,
-        progress: `claim route has no local path to materialize into`,
-      });
+    const dir = workDirFor(route, parentName);
+    if (!dir.ok) {
+      await report("Workspace", parentName, { ready: false, progress: dir.reason });
       return;
     }
 
@@ -381,13 +401,13 @@ export function startProvider(config: ProviderConfig): ProviderHandle {
     });
 
     // 2. Run the claim route's preconditions.
-    const ran = await runSteps(preconditionSteps(route), { claimParameters: parameters, workDir });
+    const ran = await runSteps(preconditionSteps(route), { claimParameters: parameters, workDir: dir.workDir });
     if (!ran.ok) {
       // Failure: progress names the why; NO child.
       await report("Workspace", parentName, { ready: false, progress: ran.error });
       return;
     }
-    const childPath = ran.path ?? workDir;
+    const childPath = ran.path ?? dir.workDir;
 
     // 3a. Build + PATCH the child (deterministic §5.3; upsert converges).
     const parentDoc = await getJson(`/Workspace/${parentName}`);

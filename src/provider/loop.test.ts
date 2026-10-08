@@ -18,7 +18,7 @@
 
 import { describe, it, expect, beforeAll, afterAll, beforeEach, afterEach } from "vitest";
 import { execFile } from "node:child_process";
-import { cpSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { cpSync, existsSync, mkdirSync, mkdtempSync, readFileSync, renameSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, dirname, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -537,6 +537,121 @@ describe("provider loop — claim matching and fulfillment", () => {
         // Nothing materialized outside the placement root.
         expect(existsSync(join(dir, "escape"))).toBe(false);
         expect(existsSync(join(rootPath, ".twill", parent, "main"))).toBe(false);
+      } finally {
+        provider.stop();
+      }
+    },
+    60_000,
+  );
+
+  it(
+    "cold-root idempotence: an already-ready parent is skipped on re-poll (a broken origin cannot flap it)",
+    async () => {
+      const parent = "p-coldskip";
+      const rootPath = join(dir, "coldskip-root");
+      writeParent(parent, rootPath, "ws_coldskip", "vol-coldskip-01");
+      store.reload();
+      const { origin } = await gitFixture();
+
+      const created = await postClaim(
+        claimBody({
+          name: "claim-coldskip",
+          parent,
+          route: parentRoute(rootPath, origin),
+          storageId: "ws_coldskip",
+          fingerprint: "vol-coldskip-01",
+        }),
+        "claim-coldskip",
+      );
+      expect(created.status).toBe(201);
+
+      const provider = startProvider({
+        registry,
+        routes: [parentRoute(rootPath, origin)],
+        parents: [parent],
+        pollIntervalMs: 50,
+      });
+      try {
+        // Wait for the cold-root fulfillment: parent ready:true, clone on disk.
+        let ready = false;
+        for (let i = 0; i < 100; i++) {
+          const status = await getStatus(parent);
+          if (status.ready === true) {
+            ready = true;
+            break;
+          }
+          await delay(50);
+        }
+        expect(ready).toBe(true);
+        expect(existsSync(join(rootPath, ".twill", parent, "main"))).toBe(true);
+
+        // Break the origin: a re-run of the gitClone step would fail its
+        // fetch. A fulfilled cold-root claim must be a no-op on re-poll
+        // (spec §6), so the parent stays ready across subsequent polls and
+        // no failure progress ever lands — no consumer-visible flapping on
+        // a transient origin outage.
+        renameSync(origin, `${origin}.broken`);
+        for (let i = 0; i < 8; i++) {
+          await delay(60);
+          const status = await getStatus(parent);
+          expect(status.ready).toBe(true);
+          // A re-run that failed would have replaced the never-observed
+          // default progress with the fetch error.
+          expect(status.progress).toBe("no provider report yet");
+        }
+      } finally {
+        provider.stop();
+      }
+    },
+    60_000,
+  );
+
+  it(
+    "non-local route guard: an ssh route carrying a path fails loud (progress names the route type), no local materialization",
+    async () => {
+      const parent = "p-sshroute";
+      const rootPath = join(dir, "sshroute-root");
+      writeParent(parent, rootPath, "ws_sshroute", "vol-sshroute-01");
+      store.reload();
+      const { origin } = await gitFixture();
+
+      // A misconfigured non-local route that CARRIES a path: the provider
+      // must refuse to materialize it locally at the remote path.
+      const sshRoute: Route = {
+        match: { agentLocation: "workstation" },
+        type: "ssh",
+        host: "example.invalid",
+        path: rootPath,
+        precondition: { steps: [{ type: "gitClone", url: origin, ref: "main" }] },
+      };
+      const created = await postClaim(
+        claimBody({
+          name: "claim-sshroute",
+          parent,
+          route: sshRoute,
+          parameters: { worktreeName: "wt-ssh" },
+          storageId: "ws_sshroute",
+          fingerprint: "vol-sshroute-01",
+        }),
+        "claim-sshroute",
+      );
+      expect(created.status).toBe(201);
+
+      const provider = startProvider({ registry, routes: [sshRoute], parents: [parent], pollIntervalMs: 50 });
+      try {
+        let sawGuard = false;
+        for (let i = 0; i < 100; i++) {
+          const status = await getStatus(parent);
+          if (status.ready === false && status.progress !== undefined && status.progress.includes("ssh")) {
+            sawGuard = true;
+            break;
+          }
+          await delay(50);
+        }
+        expect(sawGuard).toBe(true);
+        // Nothing materialized at the route's path, no child written.
+        expect(existsSync(join(rootPath, ".twill", parent))).toBe(false);
+        expect((await getWorkspace(`${parent}-wt-ssh`)).status).toBe(404);
       } finally {
         provider.stop();
       }
