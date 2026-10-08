@@ -83,6 +83,12 @@ async function makePresentClone(): Promise<string> {
   const repo = join(workDir, "main");
   mkdirSync(workDir, { recursive: true });
   await git(workDir, ["clone", "-q", origin, repo]);
+  // Hermetic identity: the clone's origin is a local path, so no conditional
+  // includeIf fires and the gecos is empty — without an
+  // explicit identity the diverged test's commit fails with "Author identity
+  // unknown" on hosts where git can't auto-derive one.
+  await git(repo, ["config", "user.email", "fixture@twill"]);
+  await git(repo, ["config", "user.name", "fixture"]);
   await git(repo, ["config", "commit.gpgsign", "false"]);
   await git(repo, ["checkout", "-q", "--detach", "HEAD"]);
   return repo;
