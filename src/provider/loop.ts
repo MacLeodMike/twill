@@ -47,7 +47,8 @@
 // invalid parameter.
 
 import { homedir } from "node:os";
-import { API_VERSION, type Route } from "../registry/document.js";
+import { type Route } from "../registry/document.js";
+import { buildChildDocument, childNameFor, type ClaimEnvelope } from "./child.js";
 import { isMine } from "./match.js";
 import { runPrecondition, type PreconditionStep } from "./preconditions.js";
 
@@ -75,19 +76,6 @@ export interface ProviderHandle {
 }
 
 type StatusReportBody = { ready?: boolean; provisionable?: boolean; progress?: string };
-
-/** A claim envelope as served by GET /claims (the raw YAML projection). */
-type ClaimEnvelope = {
-  metadata?: { name?: string };
-  spec?: {
-    parent?: { kind?: string; name?: string };
-    claim?: {
-      route?: unknown;
-      parameters?: unknown;
-      released?: boolean;
-    };
-  };
-};
 
 /** Normalize the registry base: ensure it ends with the API prefix. */
 function registryBase(registry: string): string {
@@ -178,66 +166,6 @@ function preconditionSteps(route: Route): PreconditionStep[] {
     (step): step is PreconditionStep =>
       typeof step === "object" && step !== null && !Array.isArray(step) && typeof (step as Record<string, unknown>)["type"] === "string",
   );
-}
-
-/**
- * Build the child Workspace document per §5.3's deterministic rules:
- * name = <parent>-<worktreeName>; storage.id = <parent-storage.id>-<worktreeName>;
- * spec.parent = the parent; fingerprint = the parent's; routes = the claim
- * route copied with `path` → the materialized child path, `precondition`
- * dropped, `match`/`type` preserved exactly. Task 4 owns this construction
- * formally; the loop wires it here so fulfillment can PATCH the child.
- */
-function buildChildDocument(args: {
-  parent: Record<string, unknown>;
-  parentName: string;
-  worktreeName: string;
-  claimRoute: Route;
-  childPath: string;
-}): Record<string, unknown> {
-  const { parent, parentName, worktreeName, claimRoute: route, childPath } = args;
-  const parentSpec = (parent["spec"] ?? {}) as Record<string, unknown>;
-  const parentWorkspace = (parentSpec["workspace"] ?? {}) as Record<string, unknown>;
-  const parentStorage = (parentWorkspace["storage"] ?? {}) as Record<string, unknown>;
-  const parentStorageId = typeof parentStorage["id"] === "string" ? parentStorage["id"] : parentName;
-  const parentFingerprint = parentStorage["fingerprint"];
-  const parentMetadata = (parent["metadata"] ?? {}) as Record<string, unknown>;
-  const owner = typeof parentSpec["owner"] === "string" ? parentSpec["owner"] : "";
-
-  // The claim route copied: path → childPath, precondition dropped,
-  // match/type preserved exactly.
-  const childRoute: Record<string, unknown> = {};
-  for (const [key, value] of Object.entries(route)) {
-    if (key === "precondition") continue;
-    childRoute[key] = value;
-  }
-  childRoute["path"] = childPath;
-
-  const child: Record<string, unknown> = {
-    apiVersion: API_VERSION,
-    kind: "Workspace",
-    metadata: { name: `${parentName}-${worktreeName}` },
-    spec: {
-      owner,
-      routes: [childRoute],
-      workspace: {
-        ...(typeof parentWorkspace === "object" && parentWorkspace !== null ? parentWorkspace : {}),
-        storage: {
-          ...(typeof parentStorage === "object" && parentStorage !== null ? parentStorage : {}),
-          id: `${parentStorageId}-${worktreeName}`,
-          fingerprint: parentFingerprint,
-        },
-      },
-      parent: { kind: "Workspace", name: parentName },
-    },
-    status: {},
-  };
-  // Preserve the parent's labels (workspace-class etc.) when present.
-  const labels = parentMetadata["labels"];
-  if (typeof labels === "object" && labels !== null && !Array.isArray(labels)) {
-    (child["metadata"] as Record<string, unknown>)["labels"] = labels;
-  }
-  return child;
 }
 
 /** Run a route's precondition steps in order; the first failure aborts. */
@@ -381,7 +309,7 @@ export function startProvider(config: ProviderConfig): ProviderHandle {
       return;
     }
 
-    const childName = `${parentName}-${worktreeName}`;
+    const childName = childNameFor(parentName, worktreeName);
 
     // Idempotence (spec §6): an already-fulfilled claim — child exists AND
     // ready — is a no-op.
@@ -409,7 +337,12 @@ export function startProvider(config: ProviderConfig): ProviderHandle {
     }
     const childPath = ran.path ?? dir.workDir;
 
-    // 3a. Build + PATCH the child (deterministic §5.3; upsert converges).
+    // 3a. Build + PATCH the child (deterministic §5.3 — child.ts; the
+    // upsert converges: a duplicate claim re-yields the same name/id).
+    // buildChildDocument derives the parent name from the fetched envelope;
+    // childNameFor(parentName, …) above derives it from the polled name —
+    // the two agree (GET serves doc.raw, whose metadata.name is the key),
+    // and any disagreement 400s loud at the upsert's name-match check.
     const parentDoc = await getJson(`/Workspace/${parentName}`);
     if (typeof parentDoc !== "object" || parentDoc === null) {
       await report("Workspace", parentName, {
@@ -418,13 +351,7 @@ export function startProvider(config: ProviderConfig): ProviderHandle {
       });
       return;
     }
-    const child = buildChildDocument({
-      parent: parentDoc as Record<string, unknown>,
-      parentName,
-      worktreeName,
-      claimRoute: route,
-      childPath,
-    });
+    const child = buildChildDocument(parentDoc as Record<string, unknown>, claim, childPath);
     const patched = await patchDocument("Workspace", childName, child);
     if (!patched.ok) {
       const err = (await patched.json().catch(() => undefined)) as { error?: string } | undefined;
