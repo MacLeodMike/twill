@@ -12,6 +12,16 @@
 //        [--param k=v]... [--name <claimName>]
 //   twill claim release <parentKind> <parentName> <claimName>
 //   twill claims <parentKind> <parentName>
+//   twill provider --config <file>
+//
+// provider runs the localhost provider loop (T2.5) as a standalone
+// long-running process: it reads the provider config file (YAML; JSON is
+// its strict subset — the registry's own representation format), boots
+// startProvider (the SAME embeddable entry point twill-pi uses), logs one
+// line per lifecycle event (claim fulfilled / failed / ignored / skipped)
+// to stdout, and runs until SIGINT (graceful: polling stops, in-flight
+// fulfillments settle). Exit codes: 0 on a SIGINT stop, 1 on config or
+// usage error.
 //
 // Output pins: resolve prints the Attached descriptor as pretty JSON
 // (NoMatch/Unreachable print the word plainly); get/health print the
@@ -27,7 +37,7 @@ const DEFAULT_REGISTRY = "http://localhost:8080/twill/v1alpha1";
 const DEFAULT_AGENT_LOCATION = "workstation";
 const DEFAULT_AGENT_KIND = "twill-cli/0.1.0";
 
-const COMMANDS = ["resolve", "list", "get", "health", "claim", "claims"] as const;
+const COMMANDS = ["resolve", "list", "get", "health", "claim", "claims", "provider"] as const;
 type Command = (typeof COMMANDS)[number];
 
 const FLAG_NAMES = [
@@ -38,6 +48,7 @@ const FLAG_NAMES = [
   "--route",
   "--param",
   "--name",
+  "--config",
 ] as const;
 
 type Parsed = {
@@ -51,6 +62,7 @@ type Parsed = {
   /** Repeated --param k=v occurrences, in argv order. */
   params: string[];
   name: string | undefined;
+  config: string | undefined;
 };
 
 /** Any invocation error that is the caller's fault: message on stderr, exit 1. */
@@ -64,6 +76,7 @@ const USAGE = `usage:
   twill claim create <parentKind> <parentName> --principal <p> --route '<json>' [--param k=v]... [--name <n>]
   twill claim release <parentKind> <parentName> <claimName>
   twill claims <parentKind> <parentName>
+  twill provider --config <file>
 flags: --registry <url> (env TWILL_REGISTRY, default ${DEFAULT_REGISTRY})`;
 
 /** Parse argv (post-node, post-script). Throws UsageError on any malformation. */
@@ -108,6 +121,7 @@ function parseArgs(argv: string[], env: NodeJS.ProcessEnv): Parsed {
     route: flags.get("--route"),
     params,
     name: flags.get("--name"),
+    config: flags.get("--config"),
   };
 }
 
@@ -445,6 +459,45 @@ function printTable(rows: Array<Record<string, unknown>>, columns: readonly stri
   for (const row of rows) console.log(line(columns.map((c) => cell(row, c))));
 }
 
+/**
+ * provider (T2.5 Task 5): the localhost provider loop as a standalone
+ * long-running process — the shape an in-cluster deployment uses later
+ * (provider spec §2). A thin wrapper over the embeddable entry point: the
+ * config file IS the ProviderConfig wire shape, startProvider is the SAME
+ * function twill-pi embeds in-process, and the loop's onEvent lines go to
+ * stdout ("logs fulfillments").
+ *
+ * Long-running: this function never returns — the process stays alive on
+ * the provider's poll timer until SIGINT (graceful: stop() ends polling,
+ * in-flight fulfillments settle, exit 0). Config errors exit 1 via
+ * UsageError (the operator's fault, same class as a malformed flag).
+ */
+async function cmdProvider(p: Parsed): Promise<number> {
+  if (p.config === undefined) {
+    throw new UsageError("provider requires --config <file> (the provider config: registry, routes, parents)");
+  }
+  // Lazy import: the CLI's other commands stay dependency-free (the
+  // provider library carries the yaml parse + ProviderConfig type the
+  // dependency-free CLI must not import statically).
+  const { loadProviderConfig, consoleSink } = await import("../provider/config.js");
+  const { startProvider } = await import("../provider/loop.js");
+  let config: ReturnType<typeof loadProviderConfig>;
+  try {
+    config = loadProviderConfig(p.config);
+  } catch (err) {
+    throw new UsageError(err instanceof Error ? err.message : String(err));
+  }
+  const provider = startProvider({ ...config, onEvent: consoleSink });
+  console.log(
+    `twill: provider serving ${config.parents.length} parent(s), ${config.routes.length} route(s) against ${config.registry} — ctrl-c to stop`,
+  );
+  process.on("SIGINT", () => {
+    provider.stop();
+    console.error("twill: SIGINT — provider stopped");
+  });
+  return await new Promise<number>(() => {}); // alive on the poll timer until SIGINT
+}
+
 /** The whole invocation; returns the process exit code. */
 async function main(argv: string[], env: NodeJS.ProcessEnv): Promise<number> {
   let parsed: Parsed;
@@ -472,6 +525,8 @@ async function main(argv: string[], env: NodeJS.ProcessEnv): Promise<number> {
         return await cmdClaim(parsed);
       case "claims":
         return await cmdClaims(parsed);
+      case "provider":
+        return await cmdProvider(parsed);
     }
   } catch (err) {
     if (err instanceof UsageError) {

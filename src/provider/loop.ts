@@ -68,6 +68,15 @@ export interface ProviderConfig {
   routes: Route[];
   parents: string[];
   pollIntervalMs?: number;
+  /**
+   * Optional lifecycle observer: called once per poll-observed event
+   * (claim fulfilled, fulfillment failed, claim ignored, claim skipped as
+   * already fulfilled) with a single self-describing line. The CLI wires
+   * console.log ("logs fulfillments to stdout", spec §2); twill-pi routes
+   * it into pi's own logging. Lines carry a leading ISO timestamp, stamped
+   * here once so embedders need no timestamp logic.
+   */
+  onEvent?: (line: string) => void;
 }
 
 /** The embeddable handle: stop() halts polling; in-flight fulfillments settle. */
@@ -76,6 +85,15 @@ export interface ProviderHandle {
 }
 
 type StatusReportBody = { ready?: boolean; provisionable?: boolean; progress?: string };
+
+/** One lifecycle event (Task 5): the loop stamps exactly {event, at} — a
+ *  future event extends the payload without a signature change. */
+type ProviderEvent = { event: string; at: string };
+
+/** The one-line lifecycle rendering shared by every event. */
+function renderEvent(e: ProviderEvent): string {
+  return `${e.at} ${e.event}`;
+}
 
 /** Normalize the registry base: ensure it ends with the API prefix. */
 function registryBase(registry: string): string {
@@ -198,6 +216,16 @@ export function startProvider(config: ProviderConfig): ProviderHandle {
   let stopped = false;
   let polling = false;
 
+  /** Emit one lifecycle line (no sink configured = the embedder observes nothing). */
+  function emit(event: string): void {
+    config.onEvent?.(renderEvent({ event, at: new Date().toISOString() }));
+  }
+
+  /** The claim's own name, for log lines. */
+  function claimNameOf(claim: ClaimEnvelope): string {
+    return claim.metadata?.name ?? "(unnamed claim)";
+  }
+
   async function report(kind: string, name: string, body: StatusReportBody): Promise<void> {
     await fetch(`${base}/${kind}/${name}/statusReport`, {
       method: "POST",
@@ -286,18 +314,24 @@ export function startProvider(config: ProviderConfig): ProviderHandle {
       // ready:false on the re-run's fetch error — consumer-visible flapping.
       // Retry-on-failure is preserved: ready is false after a failed
       // attempt, so the next poll re-runs the steps.
-      if ((await parentStatus(parentName, consumer)).ready === true) return;
+      if ((await parentStatus(parentName, consumer)).ready === true) {
+        emit(`claim ${claimNameOf(claim)} skipped (parent ${parentName} already ready)`);
+        return;
+      }
       const dir = workDirFor(route, parentName);
       if (!dir.ok) {
         await report("Workspace", parentName, { ready: false, progress: dir.reason });
+        emit(`claim ${claimNameOf(claim)} failed: ${dir.reason}`);
         return;
       }
       const ran = await runSteps(preconditionSteps(route), { claimParameters: parameters, workDir: dir.workDir });
       if (!ran.ok) {
         await report("Workspace", parentName, { ready: false, progress: ran.error });
+        emit(`claim ${claimNameOf(claim)} failed: ${ran.error}`);
         return;
       }
       await report("Workspace", parentName, { ready: true });
+      emit(`claim ${claimNameOf(claim)} fulfilled: parent ${parentName} ready`);
       return;
     }
 
@@ -306,6 +340,7 @@ export function startProvider(config: ProviderConfig): ProviderHandle {
     const unsafe = unsafePathSegment(worktreeName);
     if (unsafe !== undefined) {
       await report("Workspace", parentName, { ready: false, progress: unsafe });
+      emit(`claim ${claimNameOf(claim)} failed: ${unsafe}`);
       return;
     }
 
@@ -313,11 +348,15 @@ export function startProvider(config: ProviderConfig): ProviderHandle {
 
     // Idempotence (spec §6): an already-fulfilled claim — child exists AND
     // ready — is a no-op.
-    if (await childReady(childName, consumer)) return;
+    if (await childReady(childName, consumer)) {
+      emit(`claim ${claimNameOf(claim)} skipped (child ${childName} already ready)`);
+      return;
+    }
 
     const dir = workDirFor(route, parentName);
     if (!dir.ok) {
       await report("Workspace", parentName, { ready: false, progress: dir.reason });
+      emit(`claim ${claimNameOf(claim)} failed: ${dir.reason}`);
       return;
     }
 
@@ -327,12 +366,14 @@ export function startProvider(config: ProviderConfig): ProviderHandle {
       ready: false,
       progress: `provisioning ${worktreeName}`,
     });
+    emit(`claim ${claimNameOf(claim)}: provisioning ${childName} on ${parentName}`);
 
     // 2. Run the claim route's preconditions.
     const ran = await runSteps(preconditionSteps(route), { claimParameters: parameters, workDir: dir.workDir });
     if (!ran.ok) {
       // Failure: progress names the why; NO child.
       await report("Workspace", parentName, { ready: false, progress: ran.error });
+      emit(`claim ${claimNameOf(claim)} failed: ${ran.error}`);
       return;
     }
     const childPath = ran.path ?? dir.workDir;
@@ -345,20 +386,18 @@ export function startProvider(config: ProviderConfig): ProviderHandle {
     // and any disagreement 400s loud at the upsert's name-match check.
     const parentDoc = await getJson(`/Workspace/${parentName}`);
     if (typeof parentDoc !== "object" || parentDoc === null) {
-      await report("Workspace", parentName, {
-        ready: false,
-        progress: `parent Workspace/${parentName} not found`,
-      });
+      const reason = `parent Workspace/${parentName} not found`;
+      await report("Workspace", parentName, { ready: false, progress: reason });
+      emit(`claim ${claimNameOf(claim)} failed: ${reason}`);
       return;
     }
     const child = buildChildDocument(parentDoc as Record<string, unknown>, claim, childPath);
     const patched = await patchDocument("Workspace", childName, child);
     if (!patched.ok) {
       const err = (await patched.json().catch(() => undefined)) as { error?: string } | undefined;
-      await report("Workspace", parentName, {
-        ready: false,
-        progress: `child PATCH rejected: ${err?.error ?? `HTTP ${patched.status}`}`,
-      });
+      const reason = `child PATCH rejected: ${err?.error ?? `HTTP ${patched.status}`}`;
+      await report("Workspace", parentName, { ready: false, progress: reason });
+      emit(`claim ${claimNameOf(claim)} failed: ${reason}`);
       return;
     }
 
@@ -368,6 +407,7 @@ export function startProvider(config: ProviderConfig): ProviderHandle {
       ready: prior.ready,
       ...(prior.progress !== undefined ? { progress: prior.progress } : {}),
     });
+    emit(`claim ${claimNameOf(claim)} fulfilled: child ${childName} ready at ${childPath}`);
   }
 
   /** One poll of one parent's claims. */
@@ -380,7 +420,10 @@ export function startProvider(config: ProviderConfig): ProviderHandle {
       const route = claimRoute(claim);
       // Review Focus #1: a claim whose route matches none of the configured
       // routes is IGNORED — no materialization, no statusReport.
-      if (route === undefined || !isMine(route, config.routes)) continue;
+      if (route === undefined || !isMine(route, config.routes)) {
+        emit(`claim ${claimNameOf(claim)} ignored (route not owned)`);
+        continue;
+      }
       // Enqueue on the parent's serial chain.
       const tail = parentTails.get(parentName) ?? Promise.resolve();
       const next = tail.then(() => fulfill(parentName, claim)).catch(() => undefined);
