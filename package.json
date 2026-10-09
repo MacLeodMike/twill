@@ -1,27 +1,54 @@
 {
-  "name": "twill",
+  "name": "@bitwise-operations/twill",
   "version": "0.1.0",
-  "private": true,
+  "description": "The twill fabric: a typed registry + resolve/route protocol for execution environments (agent ↔ workspace). Registry server, localhost provider, and the twill CLI.",
+  "license": "MIT",
   "type": "module",
   "engines": {
     "node": ">=22"
   },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/MacLeodMike/twill.git"
+  },
+  "keywords": [
+    "twill",
+    "agent",
+    "workspace",
+    "registry",
+    "fabric"
+  ],
   "scripts": {
     "start": "tsx src/registry/server.ts",
     "test": "vitest run",
     "dev": "tsx watch src/registry/server.ts",
     "cli": "tsx src/cli/twill.ts"
   },
+  "bin": {
+    "twill": "./cli.js"
+  },
+  "exports": {
+    "./provider": "./src/provider/loop.ts",
+    "./registry": {
+      "types": "./src/registry/index.ts",
+      "default": "./src/registry/index.ts"
+    },
+    "./document": "./src/registry/document.ts"
+  },
+  "files": [
+    "src",
+    "cli.js",
+    "README.md",
+    "LICENSE",
+    "docs/superpowers/specs"
+  ],
   "dependencies": {
+    "tsx": "^4.19.0",
     "yaml": "^2.6.0"
   },
   "devDependencies": {
     "@types/node": "^22.7.0",
-    "tsx": "^4.19.0",
     "typescript": "^5.6.0",
     "vitest": "^2.1.0"
-  },
-  "exports": {
-    "./provider": "./src/provider/loop.ts"
   }
 }
