@@ -19,9 +19,9 @@
 // its strict subset — the registry's own representation format), boots
 // startProvider (the SAME embeddable entry point twill-pi uses), logs one
 // line per lifecycle event (claim fulfilled / failed / ignored / skipped)
-// to stdout, and runs until SIGINT (graceful: polling stops, in-flight
-// fulfillments settle). Exit codes: 0 on a SIGINT stop, 1 on config or
-// usage error.
+// to stdout, and runs until SIGINT or SIGTERM (graceful: polling stops,
+// in-flight fulfillments settle). Exit codes: 0 on a signal stop, 1 on
+// config or usage error.
 //
 // Output pins: resolve prints the Attached descriptor as pretty JSON
 // (NoMatch/Unreachable print the word plainly); get/health print the
