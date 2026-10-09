@@ -339,6 +339,61 @@ describe("provider loop — claim matching and fulfillment", () => {
   );
 
   it(
+    "steady-state dedup: a fulfilled claim's 'skipped' line emits once, not every poll",
+    async () => {
+      const parent = "p-dedup";
+      const rootPath = join(dir, "dedup-root");
+      writeParent(parent, rootPath, "ws_dedup", "vol-dedup-01");
+      store.reload();
+      const { origin } = await gitFixture();
+
+      const created = await postClaim(
+        claimBody({
+          name: "claim-dedup",
+          parent,
+          route: parentRoute(rootPath, origin),
+          parameters: { worktreeName: "wt-d" },
+          storageId: "ws_dedup",
+          fingerprint: "vol-dedup-01",
+        }),
+        "claim-dedup",
+      );
+      expect(created.status).toBe(201);
+
+      const lines: string[] = [];
+      const provider = startProvider({
+        registry,
+        routes: [parentRoute(rootPath, origin)],
+        parents: [parent],
+        pollIntervalMs: 50,
+        onEvent: (line) => {
+          lines.push(line);
+        },
+      });
+      try {
+        // Wait for fulfillment (child ready).
+        let child = { status: 404 };
+        for (let i = 0; i < 100; i++) {
+          child = await getWorkspace(`${parent}-wt-d`);
+          if (child.status === 200) break;
+          await delay(50);
+        }
+        expect(child.status).toBe(200);
+        // Let many more polls run (the claim stays un-released, child stays ready).
+        await delay(500); // ~10 polls at 50ms
+        // The steady-state "skipped" line fired ONCE, not ~10 times.
+        expect(lines.filter((l) => l.includes("skipped") && l.includes("already ready"))).toHaveLength(1);
+        // And the transition lines each fired exactly once.
+        expect(lines.filter((l) => l.includes("provisioning"))).toHaveLength(1);
+        expect(lines.filter((l) => l.includes("fulfilled"))).toHaveLength(1);
+      } finally {
+        provider.stop();
+      }
+    },
+    30_000,
+  );
+
+  it(
     "cold-root claim (no worktreeName): parent materialized, ready:true on the parent, no child",
     async () => {
       const parent = "p-coldroot";

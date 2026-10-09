@@ -113,6 +113,16 @@ describe("twill CLI", () => {
     },
     SPAWN_TIMEOUT_MS,
   );
+
+  it(
+    "provider rejects positional arguments (arity check before the config load)",
+    async () => {
+      const r = await runCli(["provider", "junk", "--config", "/nonexistent.yaml"]);
+      expect(r.code).toBe(1);
+      expect(r.stderr).toContain("takes no positional arguments");
+    },
+    SPAWN_TIMEOUT_MS,
+  );
 });
 
 describe("twill CLI — claims (T2a Task 6)", () => {

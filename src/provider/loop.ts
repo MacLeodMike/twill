@@ -226,6 +226,20 @@ export function startProvider(config: ProviderConfig): ProviderHandle {
     config.onEvent?.(renderEvent({ event, at: new Date().toISOString() }));
   }
 
+  // Steady-state dedup: a claim in a steady state (already-fulfilled skip, a
+  // persistent failure, route-not-owned ignore) would otherwise re-emit the
+  // identical line EVERY poll while the claim stays un-released (~17k lines/
+  // day/claim at the default interval). Suppress consecutive identical events
+  // per claim; a changed event (a retry's new provisioning, a different
+  // failure message) still emits. Keyed by claim name so concurrent parents
+  // don't thrash a shared slot.
+  const lastEventByClaim = new Map<string, string>();
+  function emitClaim(claimName: string, event: string): void {
+    if (lastEventByClaim.get(claimName) === event) return;
+    lastEventByClaim.set(claimName, event);
+    emit(event);
+  }
+
   /** The claim's own name, for log lines. */
   function claimNameOf(claim: ClaimEnvelope): string {
     return claim.metadata?.name ?? "(unnamed claim)";
@@ -320,23 +334,23 @@ export function startProvider(config: ProviderConfig): ProviderHandle {
       // Retry-on-failure is preserved: ready is false after a failed
       // attempt, so the next poll re-runs the steps.
       if ((await parentStatus(parentName, consumer)).ready === true) {
-        emit(`claim ${claimNameOf(claim)} skipped (parent ${parentName} already ready)`);
+        emitClaim(claimNameOf(claim), `claim ${claimNameOf(claim)} skipped (parent ${parentName} already ready)`);
         return;
       }
       const dir = workDirFor(route, parentName);
       if (!dir.ok) {
         await report("Workspace", parentName, { ready: false, progress: dir.reason });
-        emit(`claim ${claimNameOf(claim)} failed: ${dir.reason}`);
+        emitClaim(claimNameOf(claim), `claim ${claimNameOf(claim)} failed: ${dir.reason}`);
         return;
       }
       const ran = await runSteps(preconditionSteps(route), { claimParameters: parameters, workDir: dir.workDir });
       if (!ran.ok) {
         await report("Workspace", parentName, { ready: false, progress: ran.error });
-        emit(`claim ${claimNameOf(claim)} failed: ${ran.error}`);
+        emitClaim(claimNameOf(claim), `claim ${claimNameOf(claim)} failed: ${ran.error}`);
         return;
       }
       await report("Workspace", parentName, { ready: true });
-      emit(`claim ${claimNameOf(claim)} fulfilled: parent ${parentName} ready`);
+      emitClaim(claimNameOf(claim), `claim ${claimNameOf(claim)} fulfilled: parent ${parentName} ready`);
       return;
     }
 
@@ -345,7 +359,7 @@ export function startProvider(config: ProviderConfig): ProviderHandle {
     const unsafe = unsafePathSegment(worktreeName);
     if (unsafe !== undefined) {
       await report("Workspace", parentName, { ready: false, progress: unsafe });
-      emit(`claim ${claimNameOf(claim)} failed: ${unsafe}`);
+      emitClaim(claimNameOf(claim), `claim ${claimNameOf(claim)} failed: ${unsafe}`);
       return;
     }
 
@@ -354,14 +368,14 @@ export function startProvider(config: ProviderConfig): ProviderHandle {
     // Idempotence (spec §6): an already-fulfilled claim — child exists AND
     // ready — is a no-op.
     if (await childReady(childName, consumer)) {
-      emit(`claim ${claimNameOf(claim)} skipped (child ${childName} already ready)`);
+      emitClaim(claimNameOf(claim), `claim ${claimNameOf(claim)} skipped (child ${childName} already ready)`);
       return;
     }
 
     const dir = workDirFor(route, parentName);
     if (!dir.ok) {
       await report("Workspace", parentName, { ready: false, progress: dir.reason });
-      emit(`claim ${claimNameOf(claim)} failed: ${dir.reason}`);
+      emitClaim(claimNameOf(claim), `claim ${claimNameOf(claim)} failed: ${dir.reason}`);
       return;
     }
 
@@ -371,14 +385,14 @@ export function startProvider(config: ProviderConfig): ProviderHandle {
       ready: false,
       progress: `provisioning ${worktreeName}`,
     });
-    emit(`claim ${claimNameOf(claim)}: provisioning ${childName} on ${parentName}`);
+    emitClaim(claimNameOf(claim), `claim ${claimNameOf(claim)}: provisioning ${childName} on ${parentName}`);
 
     // 2. Run the claim route's preconditions.
     const ran = await runSteps(preconditionSteps(route), { claimParameters: parameters, workDir: dir.workDir });
     if (!ran.ok) {
       // Failure: progress names the why; NO child.
       await report("Workspace", parentName, { ready: false, progress: ran.error });
-      emit(`claim ${claimNameOf(claim)} failed: ${ran.error}`);
+      emitClaim(claimNameOf(claim), `claim ${claimNameOf(claim)} failed: ${ran.error}`);
       return;
     }
     const childPath = ran.path ?? dir.workDir;
@@ -393,7 +407,7 @@ export function startProvider(config: ProviderConfig): ProviderHandle {
     if (typeof parentDoc !== "object" || parentDoc === null) {
       const reason = `parent Workspace/${parentName} not found`;
       await report("Workspace", parentName, { ready: false, progress: reason });
-      emit(`claim ${claimNameOf(claim)} failed: ${reason}`);
+      emitClaim(claimNameOf(claim), `claim ${claimNameOf(claim)} failed: ${reason}`);
       return;
     }
     const child = buildChildDocument(parentDoc as Record<string, unknown>, claim, childPath);
@@ -402,7 +416,7 @@ export function startProvider(config: ProviderConfig): ProviderHandle {
       const err = (await patched.json().catch(() => undefined)) as { error?: string } | undefined;
       const reason = `child PATCH rejected: ${err?.error ?? `HTTP ${patched.status}`}`;
       await report("Workspace", parentName, { ready: false, progress: reason });
-      emit(`claim ${claimNameOf(claim)} failed: ${reason}`);
+      emitClaim(claimNameOf(claim), `claim ${claimNameOf(claim)} failed: ${reason}`);
       return;
     }
 
@@ -412,7 +426,7 @@ export function startProvider(config: ProviderConfig): ProviderHandle {
       ready: prior.ready,
       ...(prior.progress !== undefined ? { progress: prior.progress } : {}),
     });
-    emit(`claim ${claimNameOf(claim)} fulfilled: child ${childName} ready at ${childPath}`);
+    emitClaim(claimNameOf(claim), `claim ${claimNameOf(claim)} fulfilled: child ${childName} ready at ${childPath}`);
   }
 
   /** One poll of one parent's claims. */
@@ -426,7 +440,7 @@ export function startProvider(config: ProviderConfig): ProviderHandle {
       // Review Focus #1: a claim whose route matches none of the configured
       // routes is IGNORED — no materialization, no statusReport.
       if (route === undefined || !isMine(route, config.routes)) {
-        emit(`claim ${claimNameOf(claim)} ignored (route not owned)`);
+        emitClaim(claimNameOf(claim), `claim ${claimNameOf(claim)} ignored (route not owned)`);
         continue;
       }
       // Enqueue on the parent's serial chain.

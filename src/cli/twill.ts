@@ -473,6 +473,9 @@ function printTable(rows: Array<Record<string, unknown>>, columns: readonly stri
  * UsageError (the operator's fault, same class as a malformed flag).
  */
 async function cmdProvider(p: Parsed): Promise<number> {
+  if (p.positional.length !== 0) {
+    throw new UsageError(`provider takes no positional arguments (got: ${p.positional.join(" ")}); use --config <file>`);
+  }
   if (p.config === undefined) {
     throw new UsageError("provider requires --config <file> (the provider config: registry, routes, parents)");
   }
@@ -491,11 +494,16 @@ async function cmdProvider(p: Parsed): Promise<number> {
   console.log(
     `twill: provider serving ${config.parents.length} parent(s), ${config.routes.length} route(s) against ${config.registry} — ctrl-c to stop`,
   );
-  process.on("SIGINT", () => {
+  // SIGINT (ctrl-c) and SIGTERM (k8s pod stop, systemd, docker stop) both
+  // stop the provider gracefully: polling ends, in-flight fulfillments
+  // settle, the event loop drains, exit 0.
+  const shutdown = (signal: string) => {
     provider.stop();
-    console.error("twill: SIGINT — provider stopped");
-  });
-  return await new Promise<number>(() => {}); // alive on the poll timer until SIGINT
+    console.error(`twill: ${signal} — provider stopped`);
+  };
+  process.on("SIGINT", () => shutdown("SIGINT"));
+  process.on("SIGTERM", () => shutdown("SIGTERM"));
+  return await new Promise<number>(() => {}); // alive on the poll timer until a signal
 }
 
 /** The whole invocation; returns the process exit code. */
