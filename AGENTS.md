@@ -71,5 +71,5 @@ normal, not a hang.
 
 `npm start` (or `PORT=8091 TWILL_DOCUMENTS_DIR=<dir> npx tsx src/registry/server.ts`)
 runs a local registry. The dogfood environment lives in `~/.twill/` (documents
-in `~/.twill/documents`, scratch origin in `~/.twill/dogfood`). Port 8080 is
-taken by another service on the workstation — use another port.
+in `~/.twill/documents`, scratch origin in `~/.twill/dogfood`); use a non-default
+port if 8080 is already occupied.
