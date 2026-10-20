@@ -1,6 +1,6 @@
 {
   "name": "@bitwise-operations/twill",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "description": "The twill fabric: a typed registry + resolve/route protocol for execution environments (agent ↔ workspace). Registry server, localhost provider, and the twill CLI.",
   "license": "MIT",
   "type": "module",
